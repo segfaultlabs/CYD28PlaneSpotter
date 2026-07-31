@@ -97,6 +97,12 @@ CYD28/
 - **On the Radar screen**, tap the **+/- buttons** at the bottom-left to adjust range (10–200 km) — this also sets the aircraft data fetch radius.
 - **Open the device IP** in a browser to configure location, range, Dark Mode, and which fields show on radar blip labels.
 
+## Roadmap
+
+Ideas noted for future work, not yet implemented:
+
+- **Arrivals/departures board per nearby airport** — a dedicated screen (one per airport, e.g. GMP and ICN for the primary dev setup) listing upcoming arrivals and departures at that specific airport, rather than the existing Top 5/Target Intel screens which are organized by distance from home location instead of by airport.
+
 ## Dependencies
 
 - [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI) — TFT display driver
