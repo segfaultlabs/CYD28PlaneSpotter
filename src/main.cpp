@@ -566,6 +566,195 @@ const char* lookupAirline(const char* callsign) {
   return nullptr;
 }
 
+// =============================================================================
+// Reference data, NOT currently used anywhere — present but dormant.
+//
+// AIRLINE_CODES above (~40 entries) is what's actually wired into lookupAirline().
+// AIRLINE_CODES_FULL below is a much larger (303-entry), individually verified
+// superset of it — sourced from raw Wikipedia "List of airline codes" wikitext
+// (parsed directly, not summarized, after an early summarizer pass hallucinated
+// a wrong code) and cross-checked entry by entry. It's a straightforward drop-in
+// upgrade for lookupAirline() whenever broader fallback coverage is wanted — swap
+// the AIRLINE_CODES/AIRLINE_CODES_COUNT references in lookupAirline() to point at
+// this table instead. Costs ~6.9KB of flash.
+//
+// AIRPORT_CODES_ICAO_IATA below (319 entries, ~5.3KB, ICAO->IATA airport code
+// conversion, same verification process) has no current use case at all: the
+// only place that used to need ICAO->IATA conversion was the old hexdb.io-based
+// route lookup, which has been replaced by adsbdb.com's getFlightInfo() — that
+// already returns real IATA codes directly, globally, so there's no ICAO code
+// left anywhere in the data path to convert. It would only become useful again
+// if a secondary/backup route data source were added for when adsbdb.com is
+// unreachable or doesn't recognize a callsign.
+// =============================================================================
+
+struct AirlineCode2 { const char* prefix; const char* name; };
+static const AirlineCode2 AIRLINE_CODES_FULL[] = {
+  // Korea
+  {"KAL", "Korean Air"}, {"AAR", "Asiana"}, {"JJA", "Jeju Air"}, {"ABL", "Air Busan"}, {"ESR", "Eastar Jet"},
+  {"JNA", "Jin Air"}, {"TWB", "T'way Air"}, {"APZ", "Air Premia"},
+  // Japan / China / Taiwan / Hong Kong / Mongolia / N. Korea
+  {"ANA", "ANA"}, {"JAL", "JAL"}, {"CPA", "Cathay Pacific"}, {"HKE", "HK Express"}, {"CES", "China Eastern"},
+  {"CCA", "Air China"}, {"CSN", "China Southern"}, {"CHH", "Hainan Airlines"}, {"CXA", "Xiamen Air"},
+  {"EVA", "EVA Air"}, {"CAL", "China Airlines"}, {"CSZ", "Shenzhen Air"}, {"CSC", "Sichuan Airlines"},
+  {"CDG", "Shandong Air"}, {"CQH", "Spring Airlines"}, {"CUA", "China United"}, {"DKH", "Juneyao Air"},
+  {"GCR", "Tianjin Airlines"}, {"CBJ", "Beijing Capital"}, {"CDC", "Loong Air"}, {"OKA", "Okay Airways"},
+  {"RLH", "Ruili Airlines"}, {"CYZ", "China Postal"}, {"CSS", "SF Airlines"}, {"CKK", "China Cargo"},
+  {"AHK", "Air Hong Kong"}, {"HGB", "Greater Bay"}, {"AMU", "Air Macau"}, {"UIA", "Uni Air"}, {"SJX", "Starlux"},
+  {"TTW", "Tigerair TW"}, {"APJ", "Peach"}, {"JJP", "Jetstar Japan"}, {"TZP", "ZIPAIR"}, {"SNJ", "Solaseed Air"},
+  {"SKY", "Skymark"}, {"SFJ", "StarFlyer"}, {"MGL", "MIAT Mongolia"}, {"KOR", "Air Koryo"},
+  // Southeast Asia
+  {"SIA", "Singapore Air"}, {"THA", "Thai Airways"}, {"PAL", "Philippine Air"}, {"MAS", "Malaysia Air"},
+  {"GIA", "Garuda Indonesia"}, {"VJC", "VietJet"}, {"HVN", "Vietnam Air"}, {"TGW", "Scoot"}, {"JSA", "Jetstar Asia"},
+  {"AIQ", "Thai AirAsia"}, {"TLM", "Thai Lion Air"}, {"BKP", "Bangkok Air"}, {"NOK", "Nok Air"},
+  {"AXM", "AirAsia"}, {"XAX", "AirAsia X"}, {"FFM", "Firefly"}, {"CEB", "Cebu Pacific"}, {"GAP", "PAL Express"},
+  {"LNI", "Lion Air"}, {"SJY", "Sriwijaya Air"}, {"BAV", "Bamboo Airways"}, {"PIC", "Pacific Airlines"},
+  {"VAG", "Vietravel Air"}, {"KME", "Cambodia Airways"}, {"LAO", "Lao Airlines"}, {"MMA", "Myanmar Airways"},
+  {"GMR", "Golden Myanmar"}, {"UBA", "Myanmar National"}, {"RBA", "Royal Brunei"}, {"BTK", "Batik Air"},
+  {"CTV", "Citilink"},
+  // South Asia
+  {"AIC", "Air India"}, {"AXB", "Air India Express"}, {"IGO", "IndiGo"}, {"SEJ", "SpiceJet"}, {"AKJ", "Akasa Air"},
+  {"PIA", "Pakistan Intl"}, {"ABQ", "Airblue"}, {"BBC", "Biman Bangladesh"}, {"UBG", "US-Bangla"},
+  {"ALK", "SriLankan"}, {"EXV", "FitsAir"}, {"RNA", "Nepal Airlines"}, {"BHA", "Buddha Air"}, {"DRK", "Druk Air"},
+  {"DQA", "Maldivian"},
+  // Central Asia / Caucasus
+  {"KZR", "Air Astana"}, {"VSV", "SCAT Airlines"}, {"UZB", "Uzbekistan Air"}, {"SMR", "Somon Air"},
+  {"TUA", "Turkmenistan Air"}, {"AVJ", "Avia Traffic"}, {"TGZ", "Georgian Airways"}, {"AHY", "Azerbaijan Air"},
+  {"FIA", "FlyOne"}, {"FIE", "FlyOne Armenia"},
+  // Middle East
+  {"QTR", "Qatar Airways"}, {"UAE", "Emirates"}, {"ETD", "Etihad"}, {"SVA", "Saudia"}, {"THY", "Turkish Air"},
+  {"KNE", "flynas"}, {"FAD", "flyadeal"}, {"RJA", "Royal Jordanian"}, {"MEA", "MEA"}, {"KAC", "Kuwait Airways"},
+  {"JZR", "Jazeera Airways"}, {"GFA", "Gulf Air"}, {"OMA", "Oman Air"}, {"OMS", "SalamAir"}, {"ABY", "Air Arabia"},
+  {"FDB", "flydubai"}, {"ELY", "El Al"}, {"ISR", "Israir"}, {"AIZ", "Arkia"}, {"IAW", "Iraqi Airways"},
+  {"IRA", "Iran Air"}, {"IRM", "Mahan Air"}, {"IYE", "Yemenia"}, {"WAN", "Wataniya"},
+  // Africa
+  {"ETH", "Ethiopian"}, {"KQA", "Kenya Airways"}, {"SAA", "South African"}, {"MSR", "EgyptAir"},
+  {"RAM", "Royal Air Maroc"}, {"TAR", "Tunisair"}, {"DAH", "Air Algerie"}, {"ARA", "Arik Air"},
+  {"AFW", "Africa World"}, {"RWD", "RwandAir"}, {"ATC", "Air Tanzania"}, {"PRF", "Precision Air"},
+  {"UGD", "Uganda Airlines"}, {"NMB", "Air Namibia"}, {"CAW", "Comair"}, {"SFR", "Safair"}, {"MNO", "Mango"},
+  {"DTA", "TAAG Angola"}, {"LAM", "LAM Mozambique"}, {"AZW", "Air Zimbabwe"}, {"BOT", "Air Botswana"},
+  {"SEY", "Air Seychelles"}, {"MAU", "Air Mauritius"}, {"MDG", "Air Madagascar"}, {"TDS", "Tsaradia"},
+  {"CRC", "Camair-Co"}, {"SZN", "Air Senegal"}, {"VRE", "Air Cote d'Ivoire"}, {"VBW", "Air Burkina"},
+  {"LYW", "Libyan Airlines"}, {"AAW", "Afriqiyah"}, {"SUD", "Sudan Airways"}, {"FTZ", "Fastjet"},
+  {"OLA", "Overland Air"}, {"LNK", "Airlink"},
+  // South America
+  {"CMP", "Copa Airlines"}, {"AVA", "Avianca"}, {"GLG", "Avianca Ecuador"}, {"AZU", "Azul"}, {"GLO", "Gol"},
+  {"SKU", "Sky Airline"}, {"JAT", "JetSmart"}, {"JAP", "JetSmart Peru"}, {"ARG", "Aerolineas Arg"},
+  {"FBZ", "Flybondi"}, {"AZN", "Amaszonas"}, {"BOV", "Boliviana"}, {"VCV", "Conviasa"}, {"NSE", "Satena"},
+  {"DSM", "LATAM Argentina"}, {"TAM", "LATAM Brasil"}, {"LAN", "LATAM Chile"}, {"LNE", "LATAM Ecuador"},
+  {"LAP", "LATAM Paraguay"}, {"LPE", "LATAM Peru"}, {"ULS", "Ultra Air"},
+  // Caribbean / Central America
+  {"BWA", "Caribbean Air"}, {"BHS", "Bahamasair"}, {"CAY", "Cayman Airways"}, {"IWY", "InterCaribbean"},
+  {"ARU", "Aruba Airlines"}, {"SLM", "Surinam Airways"}, {"CUB", "Cubana"}, {"AJM", "Air Jamaica"},
+  {"RPB", "Wingo"},
+  // Europe
+  {"AFR", "Air France"}, {"DLH", "Lufthansa"}, {"BAW", "British Air"}, {"KLM", "KLM"}, {"AFL", "Aeroflot"},
+  {"IBE", "Iberia"}, {"ITY", "ITA Airways"}, {"TAP", "TAP Portugal"}, {"SAS", "SAS"}, {"FIN", "Finnair"},
+  {"SWR", "Swiss"}, {"AUA", "Austrian"}, {"BEL", "Brussels Air"}, {"LOT", "LOT Polish"}, {"CSA", "Czech Airlines"},
+  {"CTN", "Croatia Air"}, {"AEE", "Aegean"}, {"OAL", "Olympic Air"}, {"NOZ", "Norwegian"}, {"ICE", "Icelandair"},
+  {"BTI", "airBaltic"}, {"AUI", "Ukraine Intl"}, {"WZZ", "Wizz Air"}, {"RYR", "Ryanair"}, {"EZY", "easyJet"},
+  {"VLG", "Vueling"}, {"EWG", "Eurowings"}, {"CFG", "Condor"}, {"TUI", "TUIfly"}, {"PGT", "Pegasus"},
+  {"SXS", "SunExpress"}, {"CRL", "Corsair"}, {"AEA", "Air Europa"}, {"VOE", "Volotea"}, {"TRA", "Transavia"},
+  {"EIN", "Aer Lingus"}, {"LGL", "Luxair"}, {"ROT", "Tarom"}, {"LZB", "Bulgaria Air"}, {"ASL", "Air Serbia"},
+  {"MNE", "Air Montenegro"}, {"CYP", "Cyprus Airways"}, {"SBI", "S7 Airlines"}, {"SVR", "Ural Airlines"},
+  {"NWS", "Nordwind"}, {"PBD", "Pobeda"}, {"BRU", "Belavia"}, {"MLD", "Air Moldova"}, {"TVS", "Smartwings"},
+  {"NBT", "Norse Atlantic"}, {"GRL", "Air Greenland"}, {"FLI", "Atlantic Airways"}, {"CLX", "Cargolux"},
+  {"VDA", "Volga-Dnepr"}, {"ADB", "Antonov Air"}, {"DHK", "DHL Air"}, {"MPH", "Martinair"},
+  // North America
+  {"AAL", "American"}, {"UAL", "United"}, {"DAL", "Delta"}, {"SWA", "Southwest"}, {"JBU", "JetBlue"},
+  {"ASA", "Alaska"}, {"NKS", "Spirit"}, {"FFT", "Frontier"}, {"HAL", "Hawaiian"}, {"AAY", "Allegiant"},
+  {"FDX", "FedEx"}, {"UPS", "UPS"}, {"GTI", "Atlas Air"}, {"SCX", "Sun Country"}, {"ENY", "Envoy Air"},
+  {"SKW", "SkyWest"}, {"RPA", "Republic"}, {"EDV", "Endeavor Air"}, {"ASH", "Mesa Airlines"}, {"SIL", "Silver Airways"},
+  {"MXY", "Breeze"}, {"PAC", "Polar Air Cargo"}, {"CKS", "Kalitta Air"}, {"ACA", "Air Canada"},
+  {"ROU", "Air Canada Rouge"}, {"WJA", "WestJet"}, {"TSC", "Air Transat"}, {"FLE", "Flair"}, {"SWG", "Sunwing"},
+  {"CJT", "Cargojet"}, {"AMX", "Aeromexico"}, {"VOI", "Volaris"}, {"TAO", "Aeromar"}, {"VIV", "VivaAerobus"},
+  {"PTR", "Porter Airlines"}, {"AJT", "Amerijet"}, {"ABX", "ABX Air"}, {"WGN", "Western Global"},
+  // Oceania
+  {"QFA", "Qantas"}, {"JST", "Jetstar"}, {"VOZ", "Virgin Australia"}, {"RXA", "Rex Airlines"}, {"ANZ", "Air New Zealand"},
+  {"FJI", "Fiji Airways"}, {"AVN", "Air Vanuatu"}, {"ANG", "Air Niugini"}, {"SOL", "Solomon Airlines"},
+  {"THT", "Air Tahiti Nui"}, {"VTA", "Air Tahiti"}, {"ACI", "Aircalin"}, {"RON", "Nauru Airlines"},
+  {"AKL", "Air Kiribati"}, {"RAR", "Air Rarotonga"}, {"CVA", "Air Chathams"},
+};
+static const int AIRLINE_CODES_FULL_COUNT = sizeof(AIRLINE_CODES_FULL) / sizeof(AIRLINE_CODES_FULL[0]);
+
+struct AirportCode2 { const char* icao; const char* iata; };
+static const AirportCode2 AIRPORT_CODES_ICAO_IATA[] = {
+  // Korea
+  {"RKSI", "ICN"}, {"RKSS", "GMP"}, {"RKPC", "CJU"}, {"RKPK", "PUS"}, {"RKNY", "YNY"},
+  // Japan
+  {"RJAA", "NRT"}, {"RJTT", "HND"}, {"RJGG", "NGO"}, {"RJBB", "KIX"}, {"RJCC", "CTS"}, {"RJFF", "FUK"},
+  {"RJOO", "ITM"}, {"RJSS", "SDJ"}, {"RJOA", "HIJ"}, {"ROAH", "OKA"}, {"RJFK", "KOJ"}, {"RJBE", "UKB"},
+  // China
+  {"ZBAA", "PEK"}, {"ZBAD", "PKX"}, {"ZSPD", "PVG"}, {"ZSSS", "SHA"}, {"ZGGG", "CAN"}, {"ZGSZ", "SZX"},
+  {"ZUUU", "CTU"}, {"ZPPP", "KMG"}, {"ZHHH", "WUH"}, {"ZSAM", "XMN"}, {"ZSNJ", "NKG"}, {"ZLXY", "XIY"},
+  {"ZSHC", "HGH"}, {"ZUCK", "CKG"}, {"ZYTX", "SHE"}, {"ZYHB", "HRB"}, {"ZBTJ", "TSN"}, {"ZSQD", "TAO"},
+  {"ZGHA", "CSX"}, {"ZHCC", "CGO"}, {"ZUGY", "KWE"}, {"ZLLL", "LHW"}, {"ZWWW", "URC"}, {"ZJSY", "SYX"},
+  {"ZSFZ", "FOC"}, {"ZGNN", "NNG"},
+  // Hong Kong / Taiwan / Macau
+  {"VHHH", "HKG"}, {"RCTP", "TPE"}, {"RCSS", "TSA"}, {"VMMC", "MFM"},
+  // Mongolia / North Korea
+  {"ZMUB", "ULN"}, {"ZKPY", "FNJ"},
+  // Southeast Asia
+  {"WSSS", "SIN"}, {"VTBS", "BKK"}, {"VTBD", "DMK"}, {"WMKK", "KUL"}, {"RPLL", "MNL"}, {"RPVM", "CEB"},
+  {"WIII", "CGK"}, {"WARR", "SUB"}, {"WADD", "DPS"}, {"VVNB", "HAN"}, {"VVTS", "SGN"}, {"VVDN", "DAD"},
+  {"VLVT", "VTE"}, {"VDPP", "PNH"}, {"VYYY", "RGN"}, {"VYMD", "MDL"}, {"WBSB", "BWN"}, {"WMKP", "PEN"},
+  {"WMKJ", "JHB"}, {"WBKK", "BKI"}, {"VTSP", "HKT"}, {"VTCC", "CNX"},
+  // South Asia
+  {"VIDP", "DEL"}, {"VABB", "BOM"}, {"VOBL", "BLR"}, {"VOMM", "MAA"}, {"VECC", "CCU"}, {"VOHY", "HYD"},
+  {"VOCI", "COK"}, {"VAAH", "AMD"}, {"VAGO", "GOI"}, {"OPKC", "KHI"}, {"OPLA", "LHE"}, {"OPIS", "ISB"},
+  {"VGHS", "DAC"}, {"VCBI", "CMB"}, {"VNKT", "KTM"}, {"VRMM", "MLE"},
+  // Central Asia / Caucasus
+  {"UAAA", "ALA"}, {"UACC", "NQZ"}, {"UCFM", "BSZ"}, {"UTTT", "TAS"}, {"UTDD", "DYU"}, {"UTAA", "ASB"},
+  {"UGTB", "TBS"}, {"UBBB", "GYD"}, {"UDYZ", "EVN"},
+  // Middle East
+  {"OTHH", "DOH"}, {"OMDB", "DXB"}, {"OMAA", "AUH"}, {"OMSJ", "SHJ"}, {"OMDW", "DWC"}, {"OERK", "RUH"},
+  {"OEJN", "JED"}, {"OEMA", "MED"}, {"OEDF", "DMM"}, {"OKKK", "KWI"}, {"OBBI", "BAH"}, {"OOMS", "MCT"},
+  {"OOSA", "SLL"}, {"OJAI", "AMM"}, {"OLBA", "BEY"}, {"ORBI", "BGW"}, {"ORER", "EBL"}, {"OIIE", "IKA"},
+  {"OIII", "THR"}, {"OISS", "SYZ"}, {"OIFM", "IFN"}, {"OITT", "TBZ"}, {"OIMM", "MHD"}, {"LLBG", "TLV"},
+  {"LLER", "ETM"}, {"OYSN", "SAH"}, {"OYAA", "ADE"},
+  // Africa
+  {"HECA", "CAI"}, {"HAAB", "ADD"}, {"HKJK", "NBO"}, {"HKMO", "MBA"}, {"HTDA", "DAR"}, {"HTZA", "ZNZ"},
+  {"HUEN", "EBB"}, {"HSSK", "KRT"}, {"HDAM", "JIB"}, {"HCMM", "MGQ"}, {"HHAS", "ASM"}, {"HJJJ", "JUB"},
+  {"FACT", "CPT"}, {"FAOR", "JNB"}, {"FALE", "DUR"}, {"FAPE", "PLZ"}, {"FABL", "BFN"}, {"DNMM", "LOS"},
+  {"DNAA", "ABV"}, {"GMMN", "CMN"}, {"GMME", "RBA"}, {"GMMX", "RAK"}, {"DTTA", "TUN"}, {"DAAG", "ALG"},
+  {"GOBD", "DSS"}, {"GABS", "BKO"}, {"GUCY", "CKY"}, {"GFLL", "FNA"}, {"GLRB", "ROB"}, {"GBYD", "BJL"},
+  {"GGOV", "OXB"}, {"GQNO", "NKC"}, {"GVNP", "RAI"}, {"DGAA", "ACC"}, {"DXXX", "LFW"}, {"DBBB", "COO"},
+  {"DRRN", "NIM"}, {"DFFD", "OUA"}, {"FZAA", "FIH"}, {"FCBB", "BZV"}, {"FKKD", "DLA"}, {"FKYS", "NSI"},
+  {"FOOL", "LBV"}, {"FTTJ", "NDJ"}, {"FEFF", "BGF"}, {"FPST", "TMS"}, {"FGSL", "SSG"}, {"HLLT", "TIP"},
+  {"HLLM", "MJI"}, {"HLLB", "BEN"}, {"FBSK", "GBE"}, {"FVHA", "HRE"}, {"FVBU", "BUQ"}, {"FLKK", "LUN"},
+  {"FLSK", "NLA"}, {"FWCL", "BLZ"}, {"FWKI", "LLW"}, {"FMMI", "TNR"}, {"FSIA", "SEZ"}, {"FQMA", "MPM"},
+  {"FQBR", "BEW"}, {"FYWH", "WDH"},
+  // South America
+  {"MPTO", "PTY"}, {"SKBO", "BOG"}, {"SPJC", "LIM"}, {"SCEL", "SCL"}, {"SAEZ", "EZE"}, {"SBGR", "GRU"},
+  {"SBGL", "GIG"}, {"SBSP", "CGH"}, {"SBKP", "VCP"}, {"SBRJ", "SDU"}, {"SLLP", "LPB"}, {"SLVR", "VVI"},
+  {"SVMI", "CCS"}, {"SEQM", "UIO"}, {"SKSM", "SMR"},
+  // Caribbean / Central America
+  {"MUHA", "HAV"}, {"MDSD", "SDQ"}, {"MDPC", "PUJ"}, {"TJSJ", "SJU"}, {"MKJP", "KIN"}, {"MWCR", "GCM"},
+  {"TTPP", "POS"}, {"TBPB", "BGI"}, {"TLPL", "UVF"}, {"MROC", "SJO"}, {"MGGT", "GUA"}, {"MHLM", "SAP"},
+  {"MNMG", "MGA"}, {"MSLP", "SAL"}, {"MZBZ", "BZE"}, {"MYNN", "NAS"}, {"TAPA", "ANU"},
+  // Europe
+  {"EGLL", "LHR"}, {"LFPG", "CDG"}, {"EDDF", "FRA"}, {"EHAM", "AMS"}, {"UUEE", "SVO"}, {"LEMD", "MAD"},
+  {"LIRF", "FCO"}, {"LPPT", "LIS"}, {"ESSA", "ARN"}, {"EKCH", "CPH"}, {"ENGM", "OSL"}, {"EFHK", "HEL"},
+  {"LSZH", "ZRH"}, {"LOWW", "VIE"}, {"EBBR", "BRU"}, {"EPWA", "WAW"}, {"LKPR", "PRG"}, {"LDZA", "ZAG"},
+  {"LGAV", "ATH"}, {"LTFM", "IST"}, {"EIDW", "DUB"}, {"ELLX", "LUX"}, {"LROP", "OTP"}, {"LBSF", "SOF"},
+  {"LYBE", "BEG"}, {"LQSA", "SJJ"}, {"LWSK", "SKP"}, {"LATI", "TIA"}, {"LYPG", "TGD"}, {"LCLK", "LCA"},
+  {"BIKF", "KEF"}, {"EVRA", "RIX"}, {"EYVI", "VNO"}, {"EETN", "TLL"}, {"UKBB", "KBP"}, {"UMMS", "MSQ"},
+  {"LUKK", "RMO"}, {"BGSF", "SFJ"}, {"EKVG", "FAE"}, {"BGGH", "GOH"},
+  // North America
+  {"KATL", "ATL"}, {"KLAX", "LAX"}, {"KJFK", "JFK"}, {"KSFO", "SFO"}, {"KORD", "ORD"}, {"KDFW", "DFW"},
+  {"KDEN", "DEN"}, {"KSEA", "SEA"}, {"KEWR", "EWR"}, {"KIAD", "IAD"}, {"KMIA", "MIA"}, {"KBOS", "BOS"},
+  {"KLAS", "LAS"}, {"KPHX", "PHX"}, {"KIAH", "IAH"}, {"KCLT", "CLT"}, {"KMSP", "MSP"}, {"KDTW", "DTW"},
+  {"KPHL", "PHL"}, {"KMCO", "MCO"}, {"PHNL", "HNL"}, {"PANC", "ANC"}, {"KSLC", "SLC"}, {"KSAN", "SAN"},
+  {"KPDX", "PDX"}, {"KBWI", "BWI"}, {"KLGA", "LGA"}, {"KMDW", "MDW"}, {"KBNA", "BNA"}, {"KAUS", "AUS"},
+  {"CYYZ", "YYZ"}, {"CYVR", "YVR"}, {"CYUL", "YUL"}, {"CYYC", "YYC"}, {"CYOW", "YOW"}, {"CYEG", "YEG"},
+  {"CYWG", "YWG"}, {"CYHZ", "YHZ"}, {"MMMX", "MEX"}, {"MMUN", "CUN"}, {"MMGL", "GDL"}, {"MMMY", "MTY"},
+  {"MMTJ", "TIJ"}, {"MMPR", "PVR"}, {"MMSD", "SJD"}, {"MMMD", "MID"},
+  // Oceania
+  {"YSSY", "SYD"}, {"YMML", "MEL"}, {"YBBN", "BNE"}, {"YPPH", "PER"}, {"YPAD", "ADL"}, {"NZAA", "AKL"},
+  {"NFFN", "NAN"}, {"NVVV", "VLI"}, {"AYPY", "POM"}, {"AGGH", "HIR"}, {"NTAA", "PPT"}, {"NWWW", "NOU"},
+  {"ANYN", "INU"}, {"NSFA", "APW"}, {"NCRG", "RAR"}, {"PGUM", "GUM"},
+};
+static const int AIRPORT_CODES_ICAO_IATA_COUNT = sizeof(AIRPORT_CODES_ICAO_IATA) / sizeof(AIRPORT_CODES_ICAO_IATA[0]);
 
 // Small cloud glyph, top-left anchored, ~20px wide x 10px tall
 void drawCloudShape(int x, int y, uint16_t color) {
