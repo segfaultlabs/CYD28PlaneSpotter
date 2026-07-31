@@ -31,9 +31,12 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 
 - **A much larger, verified dataset exists in the source but isn't wired up.** `src/main.cpp` also contains `AIRLINE_CODES_FULL` (303 entries) and `AIRPORT_CODES_ICAO_IATA` (319 entries) — sourced from raw Wikipedia airline/airport code wikitext, parsed directly and cross-checked entry by entry (not summarized, after an early summarizer pass hallucinated a wrong code). Neither is referenced by any function, so the linker's dead-code elimination strips both entirely — confirmed via the linked binary's symbol table, flash usage is byte-identical with or without them present. `AIRLINE_CODES_FULL` is a straightforward drop-in upgrade for the active fallback table (~6.9KB once wired up) whenever broader offline coverage is wanted. `AIRPORT_CODES_ICAO_IATA` (~5.3KB) currently has no use case — the only code path that needed ICAO→IATA conversion was the old hexdb.io route lookup, which adsbdb.com's direct IATA codes made obsolete — it'd only become useful again alongside a secondary/backup route data source.
 
+- **Two permanent sprites, not one resized on the fly.** The Radar Full screen originally shared `radarSpr` with the small Radar PPI screen, resizing it (`deleteSprite()` + `createSprite()`) on every transition between the two screens rather than permanently reserving memory for both sizes at once. In practice this fragmented the heap badly enough that later allocations silently failed — both radar screens stopped drawing at all, and shortly after, TLS/HTTPS itself started failing with `X509 - Allocation of memory failed`. Fixed by allocating two separate sprites once at boot and never freeing either — `radarSpr` (200×200) and `radarSprFull` (234×234), both switched from 16-bit to 8-bit color to keep their combined footprint small enough to leave real headroom for WiFi/TLS buffers. Verified with 30+ seconds of continuous successful HTTPS calls afterward, no further allocation failures. On a single-heap, no-PSRAM board like this one, permanent fixed-size allocations made once at boot are more predictable than repeated resize/free cycles at runtime, even though they use somewhat more memory at rest.
+
 ## Features
 
 - **Radar PPI** — rotating sweep line with aircraft blips; each label's fields (callsign, altitude, route, airline, registration, squawk, vertical rate, aircraft type, speed) are independently toggleable from the web config page. Configurable range with on-screen +/- buttons.
+- **Radar Full** — a second, larger radar view: no header/clock, the circle sized to fill nearly the full screen height instead of sharing space with a side info column. Weather (icon, temp, wind) in the bottom-left margin; range value and +/- buttons in the right margin. Labels use collision avoidance so two different aircraft's labels don't draw on top of each other (the small Radar PPI screen shares this same logic).
 - **Target Intel** — detailed view of the nearest aircraft: callsign, route (origin → destination), country, distance/bearing, altitude, speed, and heading arrow.
 - **Top 5 In Range** — scrollable list of the 5 closest flights with route and altitude info.
 - **Weather & System** — live temperature, humidity, and wind from Open-Meteo, plus system stats (uptime, WiFi RSSI, free RAM, API request counters).
@@ -93,7 +96,7 @@ CYD28/
 
 ## Usage
 
-- **Tap the screen** to cycle through the 4 screens.
+- **Tap the screen** to cycle through the 5 screens (Target Intel → Top 5 → Radar PPI → Radar Full → Weather & System).
 - **On the Radar screen**, tap the **+/- buttons** at the bottom-left to adjust range (10–200 km) — this also sets the aircraft data fetch radius.
 - **Open the device IP** in a browser to configure location, range, Dark Mode, and which fields show on radar blip labels.
 
