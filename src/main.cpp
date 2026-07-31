@@ -31,6 +31,16 @@ double homeLat = DEFAULT_HOME_LAT;
 double homeLon = DEFAULT_HOME_LON;
 float  radarMaxKm = DEFAULT_RADAR_MAX_KM;
 bool   invertColors = false;  // true = light theme (hardware color invert)
+// Radar blip label field toggles — all default off, user opts in via web UI
+bool   showCallsign = false;
+bool   showSpeed = false;
+bool   showFL = false;
+bool   showRoute = false;
+bool   showAirline = false;
+bool   showReg = false;
+bool   showSquawk = false;
+bool   showVRate = false;
+bool   showType = false;
 
 SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/Radius/radarMaxKm
 WebServer server(80);
@@ -66,7 +76,11 @@ Aircraft top5[MAX_TOP5];
 uint8_t top5Count = 0;
 
 // Blips for Radar
-struct Blip { double lat; double lon; float track; float speedMs; char callsign[10]; float altitudeM; };
+struct Blip {
+  double lat; double lon; float track; float speedMs; char callsign[10]; float altitudeM;
+  char airline[24]; char reg[10]; char squawk[6]; int16_t vrateFpm; char typeCode[6]; char category[3];
+  char dep[4]; char arr[4]; bool hasRoute;  // dep/arr are IATA codes (from adsbdb.com)
+};
 const uint8_t MAX_BLIPS = 20;
 Blip blips[MAX_BLIPS];
 uint8_t blipCount = 0;
@@ -78,13 +92,15 @@ TaskHandle_t fetchTaskHandle = NULL;
 volatile bool newDataReady = false;
 volatile bool fetchInProgress = false;
 
-// Route Cache
+// Flight Info Cache — sized to comfortably hold routes for all MAX_BLIPS aircraft at once
+#define ROUTE_CACHE_SIZE 24
 struct CachedRoute {
   char callsign[10];
-  char dep[5]; char arr[5];
+  char dep[4]; char arr[4];   // IATA codes, from adsbdb.com — already 3-letter, no ICAO conversion needed
+  char airline[24];
   bool valid; uint32_t fetchTime;
 };
-CachedRoute routeCache[15];
+CachedRoute routeCache[ROUTE_CACHE_SIZE];
 
 struct Weather {
   float tempC; float windKmh; int humidity; int code; bool valid = false;
@@ -152,25 +168,32 @@ void connectWiFi() {
   tft.fillScreen(TFT_BLACK);
 }
 
-bool getRoute(const char* callsign, char* dep, char* arr) {
+// adsbdb.com's /v0/callsign/{callsign} returns airline name + both airport IATA
+// codes in one call — faster (~1s vs hexdb.io's 2-3s) and better data (real IATA
+// codes globally, no ICAO->IATA guessing/static-table needed) than the two
+// separate sources this used to combine.
+bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bool allowFetch = true) {
   if (strlen(callsign) == 0 || strcmp(callsign, "(no id)") == 0) return false;
-  
-  for (int i=0; i<15; i++) {
+
+  for (int i=0; i<ROUTE_CACHE_SIZE; i++) {
     if (routeCache[i].valid && strcmp(routeCache[i].callsign, callsign) == 0) {
       if (routeCache[i].dep[0]) {
          strcpy(dep, routeCache[i].dep);
          strcpy(arr, routeCache[i].arr);
+         strcpy(airline, routeCache[i].airline);
          return true;
       }
       return false;
     }
   }
 
+  if (!allowFetch) return false;  // cache-only lookup — skip the live HTTP call
+
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https; https.setReuse(false);
-  String url = String("https://hexdb.io/api/v1/route/icao/") + callsign;
+  String url = String("https://api.adsbdb.com/v0/callsign/") + callsign;
   bool found = false;
-  dep[0] = '\0'; arr[0] = '\0';
+  dep[0] = '\0'; arr[0] = '\0'; airline[0] = '\0';
 
   if (https.begin(client, url)) {
     uint32_t t0 = millis();
@@ -181,17 +204,14 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
       JsonDocument d;
       DeserializationError jerr = deserializeJson(d, payload);
       if (!jerr) {
-        const char* r = d["route"] | "";
-        const char* dash = strchr(r, '-');
-        if (r[0] && dash) {
-          size_t dl = dash - r;
-          if (dl < 5) {
-            strncpy(dep, r, dl); dep[dl] = '\0';
-            strncpy(arr, dash + 1, 4); arr[4] = '\0';
-            found = true;
-          }
+        JsonObject fr = d["response"]["flightroute"];
+        if (!fr.isNull()) {
+          strncpy(dep, fr["origin"]["iata_code"] | "", 3); dep[3] = '\0';
+          strncpy(arr, fr["destination"]["iata_code"] | "", 3); arr[3] = '\0';
+          strncpy(airline, fr["airline"]["name"] | "", 23); airline[23] = '\0';
+          found = dep[0] && arr[0];
         }
-        Serial.printf("[route] %s -> %s parsed dep=%s arr=%s found=%d\n", callsign, r, dep, arr, found);
+        Serial.printf("[route] %s -> %s/%s via %s found=%d\n", callsign, dep, arr, airline, found);
       } else {
         Serial.printf("[route] %s JSON parse failed: %s\n", callsign, jerr.c_str());
       }
@@ -203,7 +223,7 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
 
   int replaceIdx = 0;
   uint32_t oldest = 0xFFFFFFFF;
-  for (int i=0; i<15; i++) {
+  for (int i=0; i<ROUTE_CACHE_SIZE; i++) {
     if (!routeCache[i].valid) { replaceIdx = i; break; }
     if (routeCache[i].fetchTime < oldest) { oldest = routeCache[i].fetchTime; replaceIdx = i; }
   }
@@ -211,6 +231,7 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
   strcpy(routeCache[replaceIdx].callsign, callsign);
   strcpy(routeCache[replaceIdx].dep, dep);
   strcpy(routeCache[replaceIdx].arr, arr);
+  strcpy(routeCache[replaceIdx].airline, airline);
   routeCache[replaceIdx].fetchTime = millis();
 
   return found;
@@ -252,6 +273,10 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   JsonObject fac = filter["ac"].to<JsonArray>().add<JsonObject>();
   fac["flight"] = true; fac["lat"] = true; fac["lon"] = true;
   fac["alt_baro"] = true; fac["gs"] = true; fac["track"] = true; fac["t"] = true;
+  // Note: adsb.lol's "ownOp" field is confirmed null for essentially all traffic in
+  // this airspace, so it's not requested — airline name now comes from adsbdb.com
+  // via getFlightInfo() instead (see below), which actually has the data.
+  fac["r"] = true; fac["squawk"] = true; fac["baro_rate"] = true; fac["category"] = true;
 
   String payload = https.getString(); https.end();
   Serial.printf("[fetch] payload=%u bytes, heap after read=%u\n", payload.length(), ESP.getFreeHeap());
@@ -291,6 +316,19 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
       const char* cs = obj["flight"] | "";
       strncpy(blipsOut[blipCntOut].callsign, cs, 9);
       blipsOut[blipCntOut].callsign[9] = '\0';
+      blipsOut[blipCntOut].airline[0] = '\0';  // filled in by getFlightInfo() below, if available
+      strncpy(blipsOut[blipCntOut].reg, obj["r"] | "", 9);
+      blipsOut[blipCntOut].reg[9] = '\0';
+      strncpy(blipsOut[blipCntOut].squawk, obj["squawk"] | "", 5);
+      blipsOut[blipCntOut].squawk[5] = '\0';
+      blipsOut[blipCntOut].vrateFpm = (int16_t)(obj["baro_rate"] | 0.0f);
+      strncpy(blipsOut[blipCntOut].typeCode, obj["t"] | "", 5);
+      blipsOut[blipCntOut].typeCode[5] = '\0';
+      strncpy(blipsOut[blipCntOut].category, obj["category"] | "", 2);
+      blipsOut[blipCntOut].category[2] = '\0';
+      blipsOut[blipCntOut].hasRoute = false;
+      blipsOut[blipCntOut].dep[0] = '\0';
+      blipsOut[blipCntOut].arr[0] = '\0';
       blipCntOut++;
     }
 
@@ -357,10 +395,30 @@ void dataFetcherTask(void* param) {
     fetchInProgress = false;
 
     if (ok) {
-      // Fetch routes for the top 5 (quick per-call, but may still block a bit)
+      // Fetch routes for the top 5 (quick per-call, but may still block a bit).
+      // Aircraft doesn't currently display airline, so its name goes to a scratch buffer.
+      char tmpAirline[24];
       for (int i = 0; i < locTop5Count; i++) {
-        locTop5[i].hasRoute = getRoute(locTop5[i].callsign, locTop5[i].dep, locTop5[i].arr);
+        locTop5[i].hasRoute = getFlightInfo(locTop5[i].callsign, locTop5[i].dep, locTop5[i].arr, tmpAirline);
         locNearest = locTop5[0]; // nearest = closest after route resolution
+      }
+
+      // Flight info (route + airline) for all radar blips, without blocking the fetch
+      // cycle for long: pass 1 is a free cache-only sweep (picks up anything already
+      // known, including what the top-5 loop above just fetched); pass 2 spends a
+      // small live-fetch budget on blips that are still uncached, so new aircraft
+      // fill in over a couple of cycles instead of one fetch cycle blocking for up
+      // to a minute.
+      for (int i = 0; i < locBlipCount; i++) {
+        locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, false);
+      }
+      const int ROUTE_FETCH_BUDGET = 6;
+      int routeFetchesUsed = 0;
+      for (int i = 0; i < locBlipCount && routeFetchesUsed < ROUTE_FETCH_BUDGET; i++) {
+        if (locBlips[i].hasRoute) continue;
+        if (strlen(locBlips[i].callsign) == 0 || strcmp(locBlips[i].callsign, "(no id)") == 0) continue;
+        locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, true);
+        routeFetchesUsed++;
       }
 
       // Atomically publish results to the globals used by render()
@@ -461,6 +519,53 @@ void drawPlaneIcon(TFT_eSprite &spr, int cx, int cy, double headingDeg, uint16_t
   int fRx = tailX - (int)(sin(pw) * 2), fRy = tailY + (int)(cos(pw) * 2);
   spr.drawLine(fLx, fLy, fRx, fRy, color);
 }
+
+// Rotor-cross glyph for rotorcraft (ADS-B category "A7") — visually distinct from
+// the fixed-wing plane icon. Rotor disc is drawn fixed (rotors spin, so a heading-
+// oriented rotor would be misleading); only the short tail boom follows heading.
+void drawHelicopterIcon(TFT_eSprite &spr, int cx, int cy, double headingDeg, uint16_t color) {
+  double h = deg2rad(headingDeg);
+  int tailX = cx - (int)(sin(h) * 5), tailY = cy + (int)(cos(h) * 5);
+  spr.drawLine(cx, cy, tailX, tailY, color);
+  spr.drawLine(cx - 4, cy, cx + 4, cy, color);
+  spr.drawLine(cx, cy - 4, cx, cy + 4, color);
+  spr.fillCircle(cx, cy, 2, color);
+}
+
+// adsb.lol's "ownOp" registry field is null for the overwhelming majority of aircraft
+// outside the US (confirmed empirically for this airspace — every aircraft in a live
+// sample near Seoul came back with ownOp=null despite having callsigns, registrations,
+// and type codes). Fall back to mapping the callsign's 3-letter ICAO airline prefix to
+// a friendly name. Not exhaustive — unmapped prefixes just show nothing, same as today.
+struct AirlineCode { const char* prefix; const char* name; };
+static const AirlineCode AIRLINE_CODES[] = {
+  // Korean carriers
+  {"KAL", "Korean Air"}, {"AAR", "Asiana"}, {"JJA", "Jeju Air"}, {"ABL", "Air Busan"},
+  {"ESR", "Eastar Jet"}, {"JNA", "Jin Air"}, {"TWB", "T'way Air"}, {"APZ", "Air Premia"},
+  // Japanese / Chinese / other East Asian carriers
+  {"ANA", "ANA"}, {"JAL", "JAL"}, {"CPA", "Cathay Pacific"}, {"HKE", "HK Express"},
+  {"CES", "China Eastern"}, {"CCA", "Air China"}, {"CSN", "China Southern"},
+  {"CHH", "Hainan Airlines"}, {"CXA", "Xiamen Air"}, {"EVA", "EVA Air"}, {"CAL", "China Airlines"},
+  // Southeast Asian carriers
+  {"SIA", "Singapore Air"}, {"THA", "Thai Airways"}, {"PAL", "Philippine Air"},
+  {"MAS", "Malaysia Air"}, {"GIA", "Garuda Indonesia"}, {"VJC", "VietJet"}, {"HVN", "Vietnam Air"},
+  // US carriers
+  {"UAL", "United"}, {"DAL", "Delta"}, {"AAL", "American"}, {"FDX", "FedEx"}, {"UPS", "UPS"},
+  // Middle East / Europe / other international
+  {"QTR", "Qatar Airways"}, {"UAE", "Emirates"}, {"ETD", "Etihad"}, {"SVA", "Saudia"},
+  {"THY", "Turkish Air"}, {"AFR", "Air France"}, {"DLH", "Lufthansa"}, {"BAW", "British Air"},
+  {"KLM", "KLM"}, {"AFL", "Aeroflot"}, {"UZB", "Uzbekistan Air"},
+};
+static const int AIRLINE_CODES_COUNT = sizeof(AIRLINE_CODES) / sizeof(AIRLINE_CODES[0]);
+
+const char* lookupAirline(const char* callsign) {
+  if (strlen(callsign) < 3) return nullptr;
+  for (int i = 0; i < AIRLINE_CODES_COUNT; i++) {
+    if (strncmp(callsign, AIRLINE_CODES[i].prefix, 3) == 0) return AIRLINE_CODES[i].name;
+  }
+  return nullptr;
+}
+
 
 // Small cloud glyph, top-left anchored, ~20px wide x 10px tall
 void drawCloudShape(int x, int y, uint16_t color) {
@@ -621,8 +726,11 @@ void screenRadar(bool newPage) {
 
   // Snapshot config under mutex
   double hLat, hLon; float rMax;
+  bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
   hLat = homeLat; hLon = homeLon; rMax = radarMaxKm;
+  showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
+  showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType;
   if (configMutex) xSemaphoreGive(configMutex);
 
   tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextPadding(110);
@@ -690,32 +798,72 @@ void screenRadar(bool newPage) {
 
     float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
     uint16_t blipColor = (behind < 30) ? TFT_YELLOW : TFT_GREEN;
-    drawPlaneIcon(radarSpr, bx, by, blips[i].track, blipColor);
+    if (strcmp(blips[i].category, "A7") == 0)
+      drawHelicopterIcon(radarSpr, bx, by, blips[i].track, blipColor);
+    else
+      drawPlaneIcon(radarSpr, bx, by, blips[i].track, blipColor);
 
-    // Draw callsign label in smallest legible font
-    if (blips[i].callsign[0] && strcmp(blips[i].callsign, "(no id)") != 0) {
-      int lx = bx + 4;
-      int ly = by - 4;
-      if (lx + 54 > 200) lx = bx - 54;
-      if (ly < 0) ly = 0;
-      if (ly > 192) ly = 192;
-      radarSpr.drawString(blips[i].callsign, lx, ly);
+    // Label: every field, including the flight number itself, is independently
+    // toggled on/off — nothing is forced on. Lines are collected first so we know
+    // the total stack height and can fit the whole thing inside the sprite bounds
+    // (clamping each line independently, as before, would make several lines
+    // overlap at the same bottom edge once more fields are enabled). If nothing
+    // is toggled on (or none of it has data for this aircraft), no label is drawn.
+    {
+      char lines[9][12];
+      int lineCount = 0;
+      bool hasCallsign = blips[i].callsign[0] && strcmp(blips[i].callsign, "(no id)") != 0;
 
-      // Draw FL below callsign
-      float altFt = blips[i].altitudeM * 3.28084f;
-      char flBuf[10];
-      snprintf(flBuf, sizeof(flBuf), "FL%03.0f", altFt / 100.0f);
-      int ly2 = ly + 8;
-      if (ly2 > 192) ly2 = 192;
-      radarSpr.drawString(flBuf, lx, ly2);
+      if (showCS && hasCallsign) {
+        strncpy(lines[lineCount], blips[i].callsign, 11); lines[lineCount][11] = '\0'; lineCount++;
+      }
+      if (showFlt) {
+        float altFt = blips[i].altitudeM * 3.28084f;
+        snprintf(lines[lineCount], 12, "FL%03.0f", altFt / 100.0f);
+        lineCount++;
+      }
+      if (showRte && blips[i].hasRoute) {
+        snprintf(lines[lineCount], 12, "%s>%s", blips[i].dep, blips[i].arr);
+        lineCount++;
+      }
+      if (showAir) {
+        const char* airline = blips[i].airline[0] ? blips[i].airline : lookupAirline(blips[i].callsign);
+        if (airline) {
+          strncpy(lines[lineCount], airline, 10); lines[lineCount][10] = '\0'; lineCount++;
+        }
+      }
+      if (showRg && blips[i].reg[0]) {
+        strncpy(lines[lineCount], blips[i].reg, 11); lines[lineCount][11] = '\0'; lineCount++;
+      }
+      if (showSq && blips[i].squawk[0]) {
+        snprintf(lines[lineCount], 12, "SQ%s", blips[i].squawk);
+        lineCount++;
+      }
+      if (showVr) {
+        snprintf(lines[lineCount], 12, "%+dfpm", blips[i].vrateFpm);
+        lineCount++;
+      }
+      if (showTy && blips[i].typeCode[0]) {
+        strncpy(lines[lineCount], blips[i].typeCode, 11); lines[lineCount][11] = '\0'; lineCount++;
+      }
+      if (showSpd) {
+        float speedKt = blips[i].speedMs * 1.94384f;
+        snprintf(lines[lineCount], 12, "%ukn", (unsigned int)(speedKt + 0.5f));
+        lineCount++;
+      }
 
-      // Draw speed (knots) below FL
-      float speedKt = blips[i].speedMs * 1.94384f;
-      char spBuf[10];
-      snprintf(spBuf, sizeof(spBuf), "%ukn", (unsigned int)(speedKt + 0.5f));
-      int ly3 = ly + 16;
-      if (ly3 > 192) ly3 = 192;
-      radarSpr.drawString(spBuf, lx, ly3);
+      if (lineCount > 0) {
+        int lx = bx + 4;
+        if (lx + 54 > 200) lx = bx - 54;
+        int totalH = lineCount * 8;
+        int ly = by - 4;
+        if (ly < 0) ly = 0;
+        if (ly + totalH > 200) ly = 200 - totalH;
+        if (ly < 0) ly = 0;
+
+        for (int li = 0; li < lineCount; li++)
+          radarSpr.drawString(lines[li], lx, ly + li * 8);
+      }
     }
   }
   radarSpr.pushSprite(115, 35);
@@ -881,8 +1029,11 @@ void initWebServer() {
   server.on("/", []() {
     // Snapshot current values
     double hLat, hLon; float rMax; bool inv;
+    bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors;
+    showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
+    showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType;
     if (configMutex) xSemaphoreGive(configMutex);
 
     String html = R"rawliteral(
@@ -908,6 +1059,7 @@ void initWebServer() {
   .slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
   input:checked + .slider{background:#00ff88}
   input:checked + .slider:before{transform:translateX(22px)}
+  .section-hd{color:#888;font-size:0.75em;text-transform:uppercase;letter-spacing:0.05em;margin:18px 0 4px;border-top:1px solid #333;padding-top:14px}
 </style></head><body>
 <h1>&#9992; CYD Plane Spotter</h1>
 <div class="card">
@@ -922,6 +1074,70 @@ void initWebServer() {
       <label for="dark">Dark Mode</label>
       <label class="switch">
         <input type="checkbox" id="dark")rawliteral" + String(inv ? "" : " checked") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="section-hd">Radar Label Fields</div>
+    <div class="switch-row">
+      <label for="callsign">Flight Number</label>
+      <label class="switch">
+        <input type="checkbox" id="callsign")rawliteral" + String(showCS ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="airline">Airline Name</label>
+      <label class="switch">
+        <input type="checkbox" id="airline")rawliteral" + String(showAir ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="speed">Speed (kn)</label>
+      <label class="switch">
+        <input type="checkbox" id="speed")rawliteral" + String(showSpd ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="fl">Flight Level</label>
+      <label class="switch">
+        <input type="checkbox" id="fl")rawliteral" + String(showFlt ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="route">Route (Src &rarr; Dest)</label>
+      <label class="switch">
+        <input type="checkbox" id="route")rawliteral" + String(showRte ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="reg">Registration</label>
+      <label class="switch">
+        <input type="checkbox" id="reg")rawliteral" + String(showRg ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="squawk">Squawk</label>
+      <label class="switch">
+        <input type="checkbox" id="squawk")rawliteral" + String(showSq ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="vrate">Vertical Rate</label>
+      <label class="switch">
+        <input type="checkbox" id="vrate")rawliteral" + String(showVr ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="type">Aircraft Type</label>
+      <label class="switch">
+        <input type="checkbox" id="type")rawliteral" + String(showTy ? " checked" : "") + R"rawliteral(>
         <span class="slider"></span>
       </label>
     </div>
@@ -943,7 +1159,16 @@ function save(e){
   x.send('lat='+encodeURIComponent(document.getElementById('lat').value)+
          '&lon='+encodeURIComponent(document.getElementById('lon').value)+
          '&range='+encodeURIComponent(document.getElementById('range').value)+
-         '&dark='+(document.getElementById('dark').checked?'1':'0'));
+         '&dark='+(document.getElementById('dark').checked?'1':'0')+
+         '&callsign='+(document.getElementById('callsign').checked?'1':'0')+
+         '&airline='+(document.getElementById('airline').checked?'1':'0')+
+         '&speed='+(document.getElementById('speed').checked?'1':'0')+
+         '&fl='+(document.getElementById('fl').checked?'1':'0')+
+         '&route='+(document.getElementById('route').checked?'1':'0')+
+         '&reg='+(document.getElementById('reg').checked?'1':'0')+
+         '&squawk='+(document.getElementById('squawk').checked?'1':'0')+
+         '&vrate='+(document.getElementById('vrate').checked?'1':'0')+
+         '&type='+(document.getElementById('type').checked?'1':'0'));
 }
 </script></body></html>)rawliteral";
 
@@ -961,6 +1186,15 @@ function save(e){
     double newLon = server.arg("lon").toDouble();
     float  newRng = server.arg("range").toFloat();
     bool   newInvert = server.hasArg("dark") ? (server.arg("dark") != "1") : invertColors;
+    bool   newShowCallsign = server.hasArg("callsign") ? (server.arg("callsign") == "1") : showCallsign;
+    bool   newShowAirline = server.hasArg("airline") ? (server.arg("airline") == "1") : showAirline;
+    bool   newShowSpeed = server.hasArg("speed") ? (server.arg("speed") == "1") : showSpeed;
+    bool   newShowFL = server.hasArg("fl") ? (server.arg("fl") == "1") : showFL;
+    bool   newShowRoute = server.hasArg("route") ? (server.arg("route") == "1") : showRoute;
+    bool   newShowReg = server.hasArg("reg") ? (server.arg("reg") == "1") : showReg;
+    bool   newShowSquawk = server.hasArg("squawk") ? (server.arg("squawk") == "1") : showSquawk;
+    bool   newShowVRate = server.hasArg("vrate") ? (server.arg("vrate") == "1") : showVRate;
+    bool   newShowType = server.hasArg("type") ? (server.arg("type") == "1") : showType;
 
     // Basic validation
     if (newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180 ||
@@ -975,6 +1209,15 @@ function save(e){
     homeLon = newLon;
     radarMaxKm = newRng;
     invertColors = newInvert;
+    showCallsign = newShowCallsign;
+    showAirline = newShowAirline;
+    showSpeed = newShowSpeed;
+    showFL = newShowFL;
+    showRoute = newShowRoute;
+    showReg = newShowReg;
+    showSquawk = newShowSquawk;
+    showVRate = newShowVRate;
+    showType = newShowType;
     if (configMutex) xSemaphoreGive(configMutex);
     tft.invertDisplay(newInvert);
 
@@ -983,9 +1226,19 @@ function save(e){
     prefs.putDouble("lon", newLon);
     prefs.putFloat("range", newRng);
     prefs.putBool("invert", newInvert);
+    prefs.putBool("callsign", newShowCallsign);
+    prefs.putBool("airline", newShowAirline);
+    prefs.putBool("speed", newShowSpeed);
+    prefs.putBool("fl", newShowFL);
+    prefs.putBool("route", newShowRoute);
+    prefs.putBool("reg", newShowReg);
+    prefs.putBool("squawk", newShowSquawk);
+    prefs.putBool("vrate", newShowVRate);
+    prefs.putBool("type", newShowType);
 
-    Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d\n",
-                  newLat, newLon, newRng, newInvert);
+    Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d\n",
+                  newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,
+                  newShowRoute, newShowReg, newShowSquawk, newShowVRate, newShowType);
     server.send(200, "text/plain", "OK");
   });
 
@@ -1014,7 +1267,7 @@ void setup() {
   tft.drawString("CYD PLANE SPOTTER", 20, 100);
   delay(1500);
 
-  for (int i=0; i<15; i++) routeCache[i].valid = false;
+  for (int i=0; i<ROUTE_CACHE_SIZE; i++) routeCache[i].valid = false;
 
   connectWiFi();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
@@ -1030,9 +1283,19 @@ void setup() {
   homeLon = prefs.getDouble("lon", homeLon);
   radarMaxKm = prefs.getFloat("range", radarMaxKm);
   invertColors = prefs.getBool("invert", invertColors);
+  showCallsign = prefs.getBool("callsign", showCallsign);
+  showAirline = prefs.getBool("airline", showAirline);
+  showSpeed = prefs.getBool("speed", showSpeed);
+  showFL = prefs.getBool("fl", showFL);
+  showRoute = prefs.getBool("route", showRoute);
+  showReg = prefs.getBool("reg", showReg);
+  showSquawk = prefs.getBool("squawk", showSquawk);
+  showVRate = prefs.getBool("vrate", showVRate);
+  showType = prefs.getBool("type", showType);
   tft.invertDisplay(invertColors);
-  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d\n",
-                homeLat, homeLon, radarMaxKm, invertColors);
+  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d\n",
+                homeLat, homeLon, radarMaxKm, invertColors, showCallsign, showAirline, showSpeed, showFL,
+                showRoute, showReg, showSquawk, showVRate, showType);
 
   // Create mutexes before the task (task uses them)
   dataMutex = xSemaphoreCreateMutex();
