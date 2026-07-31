@@ -41,6 +41,11 @@ bool   showReg = false;
 bool   showSquawk = false;
 bool   showVRate = false;
 bool   showType = false;
+// When true (default): if Airline is on but Route is off, resolve the airline name
+// entirely from the local AIRLINE_CODES_FULL table and skip calling adsbdb.com for
+// that aircraft — route data can't come from a static table (it's flight-specific,
+// not a fixed code mapping), so a live call still happens whenever Route is on.
+bool   preferLocalTables = true;
 
 SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/Radius/radarMaxKm
 WebServer server(80);
@@ -372,6 +377,8 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   return true;
 }
 
+const char* lookupAirline(const char* callsign);  // defined below (needs AIRLINE_CODES_FULL)
+
 // ===================================================================
 // Background Data Fetcher — runs on Core 0 so Core 1 stays smooth
 // ===================================================================
@@ -403,22 +410,42 @@ void dataFetcherTask(void* param) {
         locNearest = locTop5[0]; // nearest = closest after route resolution
       }
 
-      // Flight info (route + airline) for all radar blips, without blocking the fetch
-      // cycle for long: pass 1 is a free cache-only sweep (picks up anything already
-      // known, including what the top-5 loop above just fetched); pass 2 spends a
-      // small live-fetch budget on blips that are still uncached, so new aircraft
-      // fill in over a couple of cycles instead of one fetch cycle blocking for up
-      // to a minute.
-      for (int i = 0; i < locBlipCount; i++) {
-        locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, false);
-      }
-      const int ROUTE_FETCH_BUDGET = 6;
-      int routeFetchesUsed = 0;
-      for (int i = 0; i < locBlipCount && routeFetchesUsed < ROUTE_FETCH_BUDGET; i++) {
-        if (locBlips[i].hasRoute) continue;
-        if (strlen(locBlips[i].callsign) == 0 || strcmp(locBlips[i].callsign, "(no id)") == 0) continue;
-        locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, true);
-        routeFetchesUsed++;
+      // Flight info (route + airline) for radar blips — but only bother at all if
+      // Route or Airline is actually toggled on; nothing to fetch otherwise.
+      bool needRte, needAir, preferTables;
+      if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+      needRte = showRoute; needAir = showAirline; preferTables = preferLocalTables;
+      if (configMutex) xSemaphoreGive(configMutex);
+
+      if (needRte || needAir) {
+        if (!needRte && preferTables) {
+          // Route not needed, and tables are preferred: route is inherently live,
+          // per-flight data no static table can provide, but airline name can be —
+          // resolve entirely locally, skip calling adsbdb.com for this pass altogether.
+          for (int i = 0; i < locBlipCount; i++) {
+            const char* a = lookupAirline(locBlips[i].callsign);
+            if (a) { strncpy(locBlips[i].airline, a, 23); locBlips[i].airline[23] = '\0'; }
+            else locBlips[i].airline[0] = '\0';
+            locBlips[i].hasRoute = false;
+          }
+        } else {
+          // Route is needed (or tables aren't preferred): must hit adsbdb.com. Pass 1
+          // is a free cache-only sweep (picks up anything already known, including
+          // what the top-5 loop above just fetched); pass 2 spends a small live-fetch
+          // budget on blips that are still uncached, so new aircraft fill in over a
+          // couple of cycles instead of one fetch cycle blocking for up to a minute.
+          for (int i = 0; i < locBlipCount; i++) {
+            locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, false);
+          }
+          const int ROUTE_FETCH_BUDGET = 6;
+          int routeFetchesUsed = 0;
+          for (int i = 0; i < locBlipCount && routeFetchesUsed < ROUTE_FETCH_BUDGET; i++) {
+            if (locBlips[i].hasRoute) continue;
+            if (strlen(locBlips[i].callsign) == 0 || strcmp(locBlips[i].callsign, "(no id)") == 0) continue;
+            locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, true);
+            routeFetchesUsed++;
+          }
+        }
       }
 
       // Atomically publish results to the globals used by render()
@@ -532,62 +559,6 @@ void drawHelicopterIcon(TFT_eSprite &spr, int cx, int cy, double headingDeg, uin
   spr.fillCircle(cx, cy, 2, color);
 }
 
-// adsb.lol's "ownOp" registry field is null for the overwhelming majority of aircraft
-// outside the US (confirmed empirically for this airspace — every aircraft in a live
-// sample near Seoul came back with ownOp=null despite having callsigns, registrations,
-// and type codes). Fall back to mapping the callsign's 3-letter ICAO airline prefix to
-// a friendly name. Not exhaustive — unmapped prefixes just show nothing, same as today.
-struct AirlineCode { const char* prefix; const char* name; };
-static const AirlineCode AIRLINE_CODES[] = {
-  // Korean carriers
-  {"KAL", "Korean Air"}, {"AAR", "Asiana"}, {"JJA", "Jeju Air"}, {"ABL", "Air Busan"},
-  {"ESR", "Eastar Jet"}, {"JNA", "Jin Air"}, {"TWB", "T'way Air"}, {"APZ", "Air Premia"},
-  // Japanese / Chinese / other East Asian carriers
-  {"ANA", "ANA"}, {"JAL", "JAL"}, {"CPA", "Cathay Pacific"}, {"HKE", "HK Express"},
-  {"CES", "China Eastern"}, {"CCA", "Air China"}, {"CSN", "China Southern"},
-  {"CHH", "Hainan Airlines"}, {"CXA", "Xiamen Air"}, {"EVA", "EVA Air"}, {"CAL", "China Airlines"},
-  // Southeast Asian carriers
-  {"SIA", "Singapore Air"}, {"THA", "Thai Airways"}, {"PAL", "Philippine Air"},
-  {"MAS", "Malaysia Air"}, {"GIA", "Garuda Indonesia"}, {"VJC", "VietJet"}, {"HVN", "Vietnam Air"},
-  // US carriers
-  {"UAL", "United"}, {"DAL", "Delta"}, {"AAL", "American"}, {"FDX", "FedEx"}, {"UPS", "UPS"},
-  // Middle East / Europe / other international
-  {"QTR", "Qatar Airways"}, {"UAE", "Emirates"}, {"ETD", "Etihad"}, {"SVA", "Saudia"},
-  {"THY", "Turkish Air"}, {"AFR", "Air France"}, {"DLH", "Lufthansa"}, {"BAW", "British Air"},
-  {"KLM", "KLM"}, {"AFL", "Aeroflot"}, {"UZB", "Uzbekistan Air"},
-};
-static const int AIRLINE_CODES_COUNT = sizeof(AIRLINE_CODES) / sizeof(AIRLINE_CODES[0]);
-
-const char* lookupAirline(const char* callsign) {
-  if (strlen(callsign) < 3) return nullptr;
-  for (int i = 0; i < AIRLINE_CODES_COUNT; i++) {
-    if (strncmp(callsign, AIRLINE_CODES[i].prefix, 3) == 0) return AIRLINE_CODES[i].name;
-  }
-  return nullptr;
-}
-
-// =============================================================================
-// Reference data, NOT currently used anywhere — present but dormant.
-//
-// AIRLINE_CODES above (~40 entries) is what's actually wired into lookupAirline().
-// AIRLINE_CODES_FULL below is a much larger (303-entry), individually verified
-// superset of it — sourced from raw Wikipedia "List of airline codes" wikitext
-// (parsed directly, not summarized, after an early summarizer pass hallucinated
-// a wrong code) and cross-checked entry by entry. It's a straightforward drop-in
-// upgrade for lookupAirline() whenever broader fallback coverage is wanted — swap
-// the AIRLINE_CODES/AIRLINE_CODES_COUNT references in lookupAirline() to point at
-// this table instead. Costs ~6.9KB of flash.
-//
-// AIRPORT_CODES_ICAO_IATA below (319 entries, ~5.3KB, ICAO->IATA airport code
-// conversion, same verification process) has no current use case at all: the
-// only place that used to need ICAO->IATA conversion was the old hexdb.io-based
-// route lookup, which has been replaced by adsbdb.com's getFlightInfo() — that
-// already returns real IATA codes directly, globally, so there's no ICAO code
-// left anywhere in the data path to convert. It would only become useful again
-// if a secondary/backup route data source were added for when adsbdb.com is
-// unreachable or doesn't recognize a callsign.
-// =============================================================================
-
 struct AirlineCode2 { const char* prefix; const char* name; };
 static const AirlineCode2 AIRLINE_CODES_FULL[] = {
   // Korea
@@ -676,6 +647,36 @@ static const AirlineCode2 AIRLINE_CODES_FULL[] = {
   {"AKL", "Air Kiribati"}, {"RAR", "Air Rarotonga"}, {"CVA", "Air Chathams"},
 };
 static const int AIRLINE_CODES_FULL_COUNT = sizeof(AIRLINE_CODES_FULL) / sizeof(AIRLINE_CODES_FULL[0]);
+
+// adsb.lol's "ownOp" registry field is null for the overwhelming majority of aircraft
+// outside the US (confirmed empirically for this airspace — every aircraft in a live
+// sample near Seoul came back with ownOp=null despite having callsigns, registrations,
+// and type codes), and adsbdb.com's live callsign lookup is a per-aircraft network
+// call. lookupAirline() maps a callsign's 3-letter ICAO prefix to a friendly airline
+// name entirely locally — used both as a fallback when adsbdb.com has no data, and
+// (when preferLocalTables is on and Route isn't needed) to skip calling adsbdb.com
+// for airline name entirely. Table is AIRLINE_CODES_FULL below (303 entries, sourced
+// from raw Wikipedia wikitext, cross-checked entry by entry — not exhaustive, but
+// covers essentially all scheduled passenger/cargo carriers worldwide).
+
+const char* lookupAirline(const char* callsign) {
+  if (strlen(callsign) < 3) return nullptr;
+  for (int i = 0; i < AIRLINE_CODES_FULL_COUNT; i++) {
+    if (strncmp(callsign, AIRLINE_CODES_FULL[i].prefix, 3) == 0) return AIRLINE_CODES_FULL[i].name;
+  }
+  return nullptr;
+}
+
+// =============================================================================
+// AIRPORT_CODES_ICAO_IATA below (319 entries, ~5.3KB, ICAO->IATA airport code
+// conversion, same verification process) has no current use case at all: the
+// only place that used to need ICAO->IATA conversion was the old hexdb.io-based
+// route lookup, which has been replaced by adsbdb.com's getFlightInfo() — that
+// already returns real IATA codes directly, globally, so there's no ICAO code
+// left anywhere in the data path to convert. It would only become useful again
+// if a secondary/backup route data source were added for when adsbdb.com is
+// unreachable or doesn't recognize a callsign.
+// =============================================================================
 
 struct AirportCode2 { const char* icao; const char* iata; };
 static const AirportCode2 AIRPORT_CODES_ICAO_IATA[] = {
@@ -1218,11 +1219,11 @@ void initWebServer() {
   server.on("/", []() {
     // Snapshot current values
     double hLat, hLon; float rMax; bool inv;
-    bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
+    bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy, preferTables;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors;
     showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
-    showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType;
+    showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType; preferTables = preferLocalTables;
     if (configMutex) xSemaphoreGive(configMutex);
 
     String html = R"rawliteral(
@@ -1330,6 +1331,13 @@ void initWebServer() {
         <span class="slider"></span>
       </label>
     </div>
+    <div class="switch-row">
+      <label for="tables">Prefer Local Tables (fewer API calls)</label>
+      <label class="switch">
+        <input type="checkbox" id="tables")rawliteral" + String(preferTables ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
     <button type="submit">Save Settings</button>
   </form>
   <div class="saved" id="msg">&#10003; Settings saved!</div>
@@ -1357,7 +1365,8 @@ function save(e){
          '&reg='+(document.getElementById('reg').checked?'1':'0')+
          '&squawk='+(document.getElementById('squawk').checked?'1':'0')+
          '&vrate='+(document.getElementById('vrate').checked?'1':'0')+
-         '&type='+(document.getElementById('type').checked?'1':'0'));
+         '&type='+(document.getElementById('type').checked?'1':'0')+
+         '&tables='+(document.getElementById('tables').checked?'1':'0'));
 }
 </script></body></html>)rawliteral";
 
@@ -1384,6 +1393,7 @@ function save(e){
     bool   newShowSquawk = server.hasArg("squawk") ? (server.arg("squawk") == "1") : showSquawk;
     bool   newShowVRate = server.hasArg("vrate") ? (server.arg("vrate") == "1") : showVRate;
     bool   newShowType = server.hasArg("type") ? (server.arg("type") == "1") : showType;
+    bool   newPreferTables = server.hasArg("tables") ? (server.arg("tables") == "1") : preferLocalTables;
 
     // Basic validation
     if (newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180 ||
@@ -1407,6 +1417,7 @@ function save(e){
     showSquawk = newShowSquawk;
     showVRate = newShowVRate;
     showType = newShowType;
+    preferLocalTables = newPreferTables;
     if (configMutex) xSemaphoreGive(configMutex);
     tft.invertDisplay(newInvert);
 
@@ -1424,10 +1435,11 @@ function save(e){
     prefs.putBool("squawk", newShowSquawk);
     prefs.putBool("vrate", newShowVRate);
     prefs.putBool("type", newShowType);
+    prefs.putBool("tables", newPreferTables);
 
-    Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d\n",
+    Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d tables=%d\n",
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,
-                  newShowRoute, newShowReg, newShowSquawk, newShowVRate, newShowType);
+                  newShowRoute, newShowReg, newShowSquawk, newShowVRate, newShowType, newPreferTables);
     server.send(200, "text/plain", "OK");
   });
 
@@ -1481,10 +1493,11 @@ void setup() {
   showSquawk = prefs.getBool("squawk", showSquawk);
   showVRate = prefs.getBool("vrate", showVRate);
   showType = prefs.getBool("type", showType);
+  preferLocalTables = prefs.getBool("tables", preferLocalTables);
   tft.invertDisplay(invertColors);
-  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d\n",
+  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d tables=%d\n",
                 homeLat, homeLon, radarMaxKm, invertColors, showCallsign, showAirline, showSpeed, showFL,
-                showRoute, showReg, showSquawk, showVRate, showType);
+                showRoute, showReg, showSquawk, showVRate, showType, preferLocalTables);
 
   // Create mutexes before the task (task uses them)
   dataMutex = xSemaphoreCreateMutex();
