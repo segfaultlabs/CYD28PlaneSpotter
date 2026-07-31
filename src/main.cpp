@@ -64,6 +64,13 @@ XPT2046_Touchscreen ts(XPT2046_CS);
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite radarSpr = TFT_eSprite(&tft);
+// Separate sprite for the full-screen radar page, permanently allocated (8-bit
+// color, ~53KB) rather than resized on demand from radarSpr — deleteSprite() +
+// createSprite() on every screen transition fragmented the heap badly enough
+// that later allocations silently failed and both radar screens stopped
+// drawing at all. Two small permanent sprites are far safer than repeated
+// alloc/free churn on this board's single, unified DRAM heap.
+TFT_eSprite radarSprFull = TFT_eSprite(&tft);
 
 // Data models
 struct Aircraft {
@@ -123,7 +130,7 @@ uint8_t lastScreen = 255;
 uint32_t lastScreenSwap = 0;
 uint32_t lastTouchMs = 0;
 bool firstWeatherDone = false;
-const uint8_t NUM_SCREENS = 4; // Reduced from 5 to 4 screens
+const uint8_t NUM_SCREENS = 5; // Target Intel, Top 5, Radar PPI, Radar Full, Weather & System
 const uint32_t SCREEN_SWAP_MS = 10000;
 
 // ---------------------------------------------------------------------------
@@ -559,6 +566,67 @@ void drawHelicopterIcon(TFT_eSprite &spr, int cx, int cy, double headingDeg, uin
   spr.fillCircle(cx, cy, 2, color);
 }
 
+// Shared by both radar screens: places a multi-line blip label near (bx,by),
+// avoiding overlap with every label already placed this frame (tracked in
+// `placed`/`placedCount`, reset once per frame by the caller). Lines can mix
+// fonts (e.g. a larger callsign line) — width/height come from the sprite's
+// actual font metrics, not a hardcoded guess. Tries a handful of fallback
+// offsets (right, left, below, above) before giving up; if none clear, the
+// label is simply skipped for this frame rather than drawn overlapping —
+// aircraft move and the sweep highlight changes constantly, so a label that's
+// briefly hidden isn't a real loss.
+struct LabelRect { int x, y, w, h; };
+
+bool placeLabel(TFT_eSprite &spr, LabelRect *placed, int &placedCount, int maxPlaced,
+                 int bx, int by, char lines[][12], const uint8_t *lineFonts, int lineCount,
+                 int spriteSize) {
+  if (lineCount == 0) return false;
+
+  int w = 0, h = 0;
+  int lineY[9];
+  for (int i = 0; i < lineCount; i++) {
+    spr.setTextFont(lineFonts[i]);
+    int lw = spr.textWidth(lines[i]);
+    if (lw > w) w = lw;
+    lineY[i] = h;
+    h += spr.fontHeight(lineFonts[i]);
+  }
+  w += 3;
+
+  const int dx[6] = { 4, -4 - w, 4, -4 - w, 4, -4 - w };
+  const int dy[6] = { -4, -4, 8, -8 - h, 12, 12 };
+
+  for (int attempt = 0; attempt < 6; attempt++) {
+    int lx = bx + dx[attempt];
+    int ly = by + dy[attempt];
+    if (lx < 0) lx = 0;
+    if (lx + w > spriteSize) lx = spriteSize - w;
+    if (ly < 0) ly = 0;
+    if (ly + h > spriteSize) ly = spriteSize - h;
+    if (lx < 0 || ly < 0) continue;  // label too big for the sprite at all
+
+    LabelRect cand = { lx, ly, w, h };
+    bool overlap = false;
+    for (int i = 0; i < placedCount; i++) {
+      LabelRect &r = placed[i];
+      if (cand.x < r.x + r.w && cand.x + cand.w > r.x &&
+          cand.y < r.y + r.h && cand.y + cand.h > r.y) {
+        overlap = true;
+        break;
+      }
+    }
+    if (!overlap) {
+      for (int li = 0; li < lineCount; li++) {
+        spr.setTextFont(lineFonts[li]);
+        spr.drawString(lines[li], lx, ly + lineY[li]);
+      }
+      if (placedCount < maxPlaced) placed[placedCount++] = cand;
+      return true;
+    }
+  }
+  return false;
+}
+
 struct AirlineCode2 { const char* prefix; const char* name; };
 static const AirlineCode2 AIRLINE_CODES_FULL[] = {
   // Korea
@@ -972,6 +1040,9 @@ void screenRadar(bool newPage) {
   radarSpr.setTextFont(1);
   radarSpr.setTextColor(TFT_WHITE, TFT_BLACK);
 
+  LabelRect placed[MAX_BLIPS];
+  int placedCount = 0;
+
   for (uint8_t i = 0; i < blipCount; i++) {
     double la = blips[i].lat, lo = blips[i].lon;
     if (blips[i].speedMs > 0 && elapsed > 0)
@@ -1001,59 +1072,53 @@ void screenRadar(bool newPage) {
     // is toggled on (or none of it has data for this aircraft), no label is drawn.
     {
       char lines[9][12];
+      uint8_t lineFonts[9];
       int lineCount = 0;
       bool hasCallsign = blips[i].callsign[0] && strcmp(blips[i].callsign, "(no id)") != 0;
 
       if (showCS && hasCallsign) {
-        strncpy(lines[lineCount], blips[i].callsign, 11); lines[lineCount][11] = '\0'; lineCount++;
+        strncpy(lines[lineCount], blips[i].callsign, 11); lines[lineCount][11] = '\0';
+        lineFonts[lineCount] = 1; lineCount++;
       }
       if (showFlt) {
         float altFt = blips[i].altitudeM * 3.28084f;
         snprintf(lines[lineCount], 12, "FL%03.0f", altFt / 100.0f);
-        lineCount++;
+        lineFonts[lineCount] = 1; lineCount++;
       }
       if (showRte && blips[i].hasRoute) {
         snprintf(lines[lineCount], 12, "%s>%s", blips[i].dep, blips[i].arr);
-        lineCount++;
+        lineFonts[lineCount] = 1; lineCount++;
       }
       if (showAir) {
         const char* airline = blips[i].airline[0] ? blips[i].airline : lookupAirline(blips[i].callsign);
         if (airline) {
-          strncpy(lines[lineCount], airline, 10); lines[lineCount][10] = '\0'; lineCount++;
+          strncpy(lines[lineCount], airline, 10); lines[lineCount][10] = '\0';
+          lineFonts[lineCount] = 1; lineCount++;
         }
       }
       if (showRg && blips[i].reg[0]) {
-        strncpy(lines[lineCount], blips[i].reg, 11); lines[lineCount][11] = '\0'; lineCount++;
+        strncpy(lines[lineCount], blips[i].reg, 11); lines[lineCount][11] = '\0';
+        lineFonts[lineCount] = 1; lineCount++;
       }
       if (showSq && blips[i].squawk[0]) {
         snprintf(lines[lineCount], 12, "SQ%s", blips[i].squawk);
-        lineCount++;
+        lineFonts[lineCount] = 1; lineCount++;
       }
       if (showVr) {
         snprintf(lines[lineCount], 12, "%+dfpm", blips[i].vrateFpm);
-        lineCount++;
+        lineFonts[lineCount] = 1; lineCount++;
       }
       if (showTy && blips[i].typeCode[0]) {
-        strncpy(lines[lineCount], blips[i].typeCode, 11); lines[lineCount][11] = '\0'; lineCount++;
+        strncpy(lines[lineCount], blips[i].typeCode, 11); lines[lineCount][11] = '\0';
+        lineFonts[lineCount] = 1; lineCount++;
       }
       if (showSpd) {
         float speedKt = blips[i].speedMs * 1.94384f;
         snprintf(lines[lineCount], 12, "%ukn", (unsigned int)(speedKt + 0.5f));
-        lineCount++;
+        lineFonts[lineCount] = 1; lineCount++;
       }
 
-      if (lineCount > 0) {
-        int lx = bx + 4;
-        if (lx + 54 > 200) lx = bx - 54;
-        int totalH = lineCount * 8;
-        int ly = by - 4;
-        if (ly < 0) ly = 0;
-        if (ly + totalH > 200) ly = 200 - totalH;
-        if (ly < 0) ly = 0;
-
-        for (int li = 0; li < lineCount; li++)
-          radarSpr.drawString(lines[li], lx, ly + li * 8);
-      }
+      placeLabel(radarSpr, placed, placedCount, MAX_BLIPS, bx, by, lines, lineFonts, lineCount, 200);
     }
   }
   radarSpr.pushSprite(115, 35);
@@ -1077,6 +1142,151 @@ void screenRadar(bool newPage) {
   tft.fillRoundRect(50, 215, 30, 20, 4, TFT_DARKGREY);
   tft.drawString("+", 60, 216);
 
+  tft.setTextPadding(0);
+}
+
+// Full-screen radar: no header/clock, circle sized to the screen's true constraint
+// (height, since it's a 320x240 landscape panel) so it's as large as it can be while
+// staying circular. Weather (icon + temp only) lives in the narrow left margin, range
+// + its +/- buttons in the narrow right margin, both left over once the circle claims
+// the full height.
+void screenRadarFull(bool newPage) {
+  const int R = 117, SPR = 234;
+  const int sprX = (320 - SPR) / 2, sprY = (240 - SPR) / 2;  // = 43, 3
+  const int cx = R, cy = R;
+
+  if (newPage) {
+    tft.fillScreen(TFT_BLACK);
+  }
+
+  double hLat, hLon; float rMax;
+  bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  hLat = homeLat; hLon = homeLon; rMax = radarMaxKm;
+  showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
+  showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType;
+  if (configMutex) xSemaphoreGive(configMutex);
+
+  float elapsed = (millis() - lastDataMs) / 1000.0f;
+
+  radarSprFull.fillSprite(TFT_BLACK);
+  radarSprFull.drawCircle(cx, cy, R, TFT_DARKGREY);
+  radarSprFull.drawCircle(cx, cy, R*2/3, TFT_DARKGREY);
+  radarSprFull.drawCircle(cx, cy, R/3, TFT_DARKGREY);
+  radarSprFull.drawLine(cx-R, cy, cx+R, cy, TFT_DARKGREY);
+  radarSprFull.drawLine(cx, cy-R, cx, cy+R, TFT_DARKGREY);
+
+  float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
+  double sw = deg2rad(sweepDeg);
+  radarSprFull.drawLine(cx, cy, cx + (int)(sin(sw)*R), cy - (int)(cos(sw)*R), TFT_GREEN);
+
+  radarSprFull.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  LabelRect placed[MAX_BLIPS];
+  int placedCount = 0;
+
+  for (uint8_t i = 0; i < blipCount; i++) {
+    double la = blips[i].lat, lo = blips[i].lon;
+    if (blips[i].speedMs > 0 && elapsed > 0)
+      projectLatLon(blips[i].lat, blips[i].lon, blips[i].track, blips[i].speedMs * elapsed, la, lo);
+
+    double dist = haversineKm(hLat, hLon, la, lo);
+    float fr = (float)(dist / rMax);
+    if (fr > 1) continue;
+
+    int rr = (int)(fr * R);
+    double brg = bearingDeg(hLat, hLon, la, lo);
+    int bx = cx + (int)(sin(deg2rad(brg)) * rr);
+    int by = cy - (int)(cos(deg2rad(brg)) * rr);
+
+    float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
+    uint16_t blipColor = (behind < 30) ? TFT_YELLOW : TFT_GREEN;
+    if (strcmp(blips[i].category, "A7") == 0)
+      drawHelicopterIcon(radarSprFull, bx, by, blips[i].track, blipColor);
+    else
+      drawPlaneIcon(radarSprFull, bx, by, blips[i].track, blipColor);
+
+    {
+      char lines[9][12];
+      uint8_t lineFonts[9];
+      int lineCount = 0;
+      bool hasCallsign = blips[i].callsign[0] && strcmp(blips[i].callsign, "(no id)") != 0;
+
+      if (showCS && hasCallsign) {
+        strncpy(lines[lineCount], blips[i].callsign, 11); lines[lineCount][11] = '\0';
+        lineFonts[lineCount] = 2; lineCount++;  // bigger font for the callsign line only
+      }
+      if (showFlt) {
+        float altFt = blips[i].altitudeM * 3.28084f;
+        snprintf(lines[lineCount], 12, "FL%03.0f", altFt / 100.0f);
+        lineFonts[lineCount] = 1; lineCount++;
+      }
+      if (showRte && blips[i].hasRoute) {
+        snprintf(lines[lineCount], 12, "%s>%s", blips[i].dep, blips[i].arr);
+        lineFonts[lineCount] = 1; lineCount++;
+      }
+      if (showAir) {
+        const char* airline = blips[i].airline[0] ? blips[i].airline : lookupAirline(blips[i].callsign);
+        if (airline) {
+          strncpy(lines[lineCount], airline, 10); lines[lineCount][10] = '\0';
+          lineFonts[lineCount] = 1; lineCount++;
+        }
+      }
+      if (showRg && blips[i].reg[0]) {
+        strncpy(lines[lineCount], blips[i].reg, 11); lines[lineCount][11] = '\0';
+        lineFonts[lineCount] = 1; lineCount++;
+      }
+      if (showSq && blips[i].squawk[0]) {
+        snprintf(lines[lineCount], 12, "SQ%s", blips[i].squawk);
+        lineFonts[lineCount] = 1; lineCount++;
+      }
+      if (showVr) {
+        snprintf(lines[lineCount], 12, "%+dfpm", blips[i].vrateFpm);
+        lineFonts[lineCount] = 1; lineCount++;
+      }
+      if (showTy && blips[i].typeCode[0]) {
+        strncpy(lines[lineCount], blips[i].typeCode, 11); lines[lineCount][11] = '\0';
+        lineFonts[lineCount] = 1; lineCount++;
+      }
+      if (showSpd) {
+        float speedKt = blips[i].speedMs * 1.94384f;
+        snprintf(lines[lineCount], 12, "%ukn", (unsigned int)(speedKt + 0.5f));
+        lineFonts[lineCount] = 1; lineCount++;
+      }
+
+      placeLabel(radarSprFull, placed, placedCount, MAX_BLIPS, bx, by, lines, lineFonts, lineCount, SPR);
+    }
+  }
+  radarSprFull.pushSprite(sprX, sprY);
+
+  // Left margin, bottom: weather icon + temperature + wind (humidity stays on the
+  // dedicated Weather & System screen — this strip is only ~43px wide).
+  tft.fillRect(0, 168, sprX, 72, TFT_BLACK);
+  if (weather.valid) {
+    drawWeatherIcon(10, 170, weather.code);
+    tft.setTextFont(1); tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.setTextPadding(sprX);
+    char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%.0fC", weather.tempC);
+    tft.drawString(tbuf, 2, 194);
+    char wbuf[10]; snprintf(wbuf, sizeof(wbuf), "%.0fkm/h", weather.windKmh);
+    tft.drawString(wbuf, 2, 206);
+    tft.setTextPadding(0);
+  }
+
+  // Right margin: range value + "+" button at the top, "-" button at the bottom.
+  int rx = sprX + SPR;  // = 277
+  tft.setTextFont(1); tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.setTextPadding(320 - rx);
+  char rng[12]; snprintf(rng, sizeof(rng), "%dkm", (int)rMax);
+  tft.drawString(rng, rx + 2, 5);
+  tft.setTextPadding(0);
+
+  tft.fillRoundRect(rx + 2, 25, 36, 30, 4, TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.setTextFont(2);
+  tft.setTextPadding(36);
+  tft.drawString("+", rx + 20, 31);
+
+  tft.fillRoundRect(rx + 2, 205, 36, 30, 4, TFT_DARKGREY);
+  tft.drawString("-", rx + 20, 211);
   tft.setTextPadding(0);
 }
 
@@ -1147,7 +1357,8 @@ void render() {
     case 0: screenTargetIntel(newPage); break;
     case 1: screenTop5(newPage);        break;
     case 2: screenRadar(newPage);       break;
-    case 3: screenWeatherSystem(newPage); break;
+    case 3: screenRadarFull(newPage);   break;
+    case 4: screenWeatherSystem(newPage); break;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
 }
@@ -1193,6 +1404,28 @@ void checkTouch() {
           }
           // "-" button: sx=10..50, sy=206..240
           if (sx >= 10 && sx <= 50 && sy >= 206 && sy <= 240) {
+            if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+            radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
+            if (configMutex) xSemaphoreGive(configMutex);
+            prefs.putFloat("range", radarMaxKm);
+            Serial.printf("Range decreased: %d km\n", (int)radarMaxKm);
+            lastScreenSwap = millis();
+            return;
+          }
+        } else if (screen == 3) {
+          // Radar Full screen: "+" button top-right, "-" button bottom-right
+          // "+" button: sx=279..315, sy=25..55
+          if (sx >= 279 && sx <= 315 && sy >= 25 && sy <= 55) {
+            if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+            radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
+            if (configMutex) xSemaphoreGive(configMutex);
+            prefs.putFloat("range", radarMaxKm);
+            Serial.printf("Range increased: %d km\n", (int)radarMaxKm);
+            lastScreenSwap = millis();
+            return;
+          }
+          // "-" button: sx=279..315, sy=205..235
+          if (sx >= 279 && sx <= 315 && sy >= 205 && sy <= 235) {
             if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
             radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
             if (configMutex) xSemaphoreGive(configMutex);
@@ -1460,8 +1693,13 @@ void setup() {
   tft.begin();
   tft.setRotation(1);
 
-  radarSpr.setColorDepth(16);
+  // Both sprites at 8-bit color (not 16-bit) to keep combined permanent memory
+  // small enough to leave room for WiFi/TLS buffers — see radarSprFull's
+  // declaration comment for why two permanent sprites beat resizing one.
+  radarSpr.setColorDepth(8);
   radarSpr.createSprite(200, 200);
+  radarSprFull.setColorDepth(8);
+  radarSprFull.createSprite(234, 234);
 
   tft.fillScreen(TFT_BLACK);
   tft.setTextFont(4); tft.setTextColor(TFT_GREEN);
