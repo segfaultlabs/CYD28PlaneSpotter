@@ -29,8 +29,8 @@
 // Defaults below; overridden by web UI and saved to flash.
 double homeLat = DEFAULT_HOME_LAT;
 double homeLon = DEFAULT_HOME_LON;
-double searchRadiusDeg = DEFAULT_SEARCH_RADIUS;
 float  radarMaxKm = DEFAULT_RADAR_MAX_KM;
+bool   invertColors = false;  // true = light theme (hardware color invert)
 
 SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/Radius/radarMaxKm
 WebServer server(80);
@@ -52,7 +52,7 @@ TFT_eSprite radarSpr = TFT_eSprite(&tft);
 
 // Data models
 struct Aircraft {
-  char callsign[10]; char country[24];
+  char callsign[10]; char country[24];  // "country" repurposed to hold adsb.lol aircraft type code
   double lat; double lon; float altitudeM; float velocityMs;
   float trackDeg; float vrateMs; bool onGround; int category;
   double distanceKm; double bearingDeg; bool valid;
@@ -173,10 +173,14 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
   dep[0] = '\0'; arr[0] = '\0';
 
   if (https.begin(client, url)) {
+    uint32_t t0 = millis();
     int code = https.GET();
+    Serial.printf("[route] %s HTTP code=%d in %lums, heap=%u\n", callsign, code, millis() - t0, ESP.getFreeHeap());
     if (code == HTTP_CODE_OK) {
+      String payload = https.getString();
       JsonDocument d;
-      if (!deserializeJson(d, https.getString())) {
+      DeserializationError jerr = deserializeJson(d, payload);
+      if (!jerr) {
         const char* r = d["route"] | "";
         const char* dash = strchr(r, '-');
         if (r[0] && dash) {
@@ -187,9 +191,14 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
             found = true;
           }
         }
+        Serial.printf("[route] %s -> %s parsed dep=%s arr=%s found=%d\n", callsign, r, dep, arr, found);
+      } else {
+        Serial.printf("[route] %s JSON parse failed: %s\n", callsign, jerr.c_str());
       }
     }
     https.end();
+  } else {
+    Serial.printf("[route] %s https.begin() failed\n", callsign);
   }
 
   int replaceIdx = 0;
@@ -211,52 +220,75 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut) {
   // Snapshot config under mutex (Core 0 reads, Core 1 may write via web UI)
-  double hLat, hLon, sRad; float rMax;
+  double hLat, hLon; float rMax;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  hLat = homeLat; hLon = homeLon; sRad = searchRadiusDeg; rMax = radarMaxKm;
+  hLat = homeLat; hLon = homeLon; rMax = radarMaxKm;
   if (configMutex) xSemaphoreGive(configMutex);
+
+  // adsb.lol's point endpoint takes a plain radius in nautical miles, which we
+  // derive directly from the on-screen radar range — keeps fetch coverage and
+  // display range in sync (adsb.lol caps this endpoint at 250nm).
+  int radiusNm = (int)(rMax / 1.852f);
+  if (radiusNm < 5) radiusNm = 5;
+  if (radiusNm > 250) radiusNm = 250;
 
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https; https.setReuse(false);
-  String url = "https://opensky-network.org/api/states/all?lamin=" + String(hLat - sRad, 4) + 
-         "&lomin=" + String(hLon - sRad, 4) + "&lamax=" + String(hLat + sRad, 4) + 
-         "&lomax=" + String(hLon + sRad, 4) + "&extended=1";
+  char urlBuf[96];
+  snprintf(urlBuf, sizeof(urlBuf), "https://api.adsb.lol/v2/point/%.4f/%.4f/%d", hLat, hLon, radiusNm);
+  String url = urlBuf;
+  Serial.printf("[fetch] GET %s (WiFi RSSI=%d dBm)\n", url.c_str(), WiFi.RSSI());
 
-  if (!https.begin(client, url)) { stats.requestsFail++; return false; }
+  if (!https.begin(client, url)) {
+    Serial.printf("[fetch] https.begin() failed, heap=%u\n", ESP.getFreeHeap());
+    stats.requestsFail++; return false;
+  }
+  uint32_t t0 = millis();
   int code = https.GET();
+  Serial.printf("[fetch] HTTP code=%d in %lums, heap=%u\n", code, millis() - t0, ESP.getFreeHeap());
   if (code != HTTP_CODE_OK) { https.end(); stats.requestsFail++; return false; }
 
   JsonDocument filter;
-  JsonArray el = filter["states"].to<JsonArray>().add<JsonArray>();
-  for (int i = 0; i <= 17; i++) el[i] = false;
-  el[0] = el[1] = el[2] = el[5] = el[6] = el[7] = el[8] = el[9] = el[10] = el[11] = el[13] = el[17] = true;
+  JsonObject fac = filter["ac"].to<JsonArray>().add<JsonObject>();
+  fac["flight"] = true; fac["lat"] = true; fac["lon"] = true;
+  fac["alt_baro"] = true; fac["gs"] = true; fac["track"] = true; fac["t"] = true;
 
   String payload = https.getString(); https.end();
+  Serial.printf("[fetch] payload=%u bytes, heap after read=%u\n", payload.length(), ESP.getFreeHeap());
   JsonDocument doc;
-  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) { stats.requestsFail++; return false; }
+  DeserializationError jerr = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+  if (jerr) {
+    Serial.printf("[fetch] JSON parse failed: %s, heap=%u\n", jerr.c_str(), ESP.getFreeHeap());
+    stats.requestsFail++; return false;
+  }
 
-  JsonArray states = doc["states"].as<JsonArray>();
-  uint16_t count = 0; 
+  JsonArray ac = doc["ac"].as<JsonArray>();
+  uint16_t count = 0;
   blipCntOut = 0;
   top5CntOut = 0;
 
-  for (JsonArray s : states) {
-    if (s.isNull() || s[5].isNull() || s[6].isNull()) continue;
+  for (JsonObject obj : ac) {
+    if (obj["lat"].isNull() || obj["lon"].isNull()) continue;
 
-    // Skip aircraft on the ground — only track those in flight
-    if (s[8] | false) continue;
+    // adsb.lol reports "alt_baro":"ground" (a string) for grounded aircraft —
+    // skip those, matching the airborne-only behavior of the old OpenSky path.
+    if (obj["alt_baro"].is<const char*>()) continue;
 
-    double lon = s[5].as<double>(), lat = s[6].as<double>();
+    double lat = obj["lat"].as<double>(), lon = obj["lon"].as<double>();
     double d = haversineKm(hLat, hLon, lat, lon);
     double brg = bearingDeg(hLat, hLon, lat, lon);
     count++;
 
+    float altM = (obj["alt_baro"] | 0.0f) * 0.3048f;   // feet -> meters
+    float spdMs = (obj["gs"] | 0.0f) * 0.514444f;      // knots -> m/s
+    float trk = obj["track"] | 0.0f;
+
     if (blipCntOut < MAX_BLIPS) {
       blipsOut[blipCntOut].lat = lat; blipsOut[blipCntOut].lon = lon;
-      blipsOut[blipCntOut].track = s[10] | 0.0f;
-      blipsOut[blipCntOut].speedMs = (s[8] | false) ? 0.0f : (s[9] | 0.0f);
-      blipsOut[blipCntOut].altitudeM = s[13].isNull() ? (s[7] | 0.0f) : s[13].as<float>();
-      const char* cs = s[1] | "";
+      blipsOut[blipCntOut].track = trk;
+      blipsOut[blipCntOut].speedMs = spdMs;
+      blipsOut[blipCntOut].altitudeM = altM;
+      const char* cs = obj["flight"] | "";
       strncpy(blipsOut[blipCntOut].callsign, cs, 9);
       blipsOut[blipCntOut].callsign[9] = '\0';
       blipCntOut++;
@@ -264,16 +296,16 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
 
     Aircraft a;
     a.distanceKm = d; a.lat = lat; a.lon = lon; a.bearingDeg = brg;
-    a.onGround = s[8] | false; a.category = s[17] | 0;
-    a.altitudeM = s[13].isNull() ? (s[7] | 0.0f) : s[13].as<float>();
-    a.velocityMs = s[9] | 0.0f; a.trackDeg = s[10] | 0.0f; a.vrateMs = s[11] | 0.0f;
+    a.onGround = false; a.category = 0;
+    a.altitudeM = altM;
+    a.velocityMs = spdMs; a.trackDeg = trk; a.vrateMs = 0.0f;
     a.hasRoute = false; a.dep[0] = '\0'; a.arr[0] = '\0';
     a.valid = true;
-    
-    strncpy(a.callsign, s[1] | "", 9); a.callsign[9] = '\0';
+
+    strncpy(a.callsign, obj["flight"] | "", 9); a.callsign[9] = '\0';
     for (int i = strlen(a.callsign) - 1; i >= 0 && a.callsign[i] == ' '; i--) a.callsign[i] = '\0';
     if (a.callsign[0] == '\0') strcpy(a.callsign, "(no id)");
-    strncpy(a.country, s[2] | "?", 23); a.country[23] = '\0';
+    strncpy(a.country, obj["t"] | "?", 23); a.country[23] = '\0';  // aircraft type code, e.g. "B738"
 
     int insertIdx = -1;
     for (int i = 0; i < MAX_TOP5; i++) {
@@ -354,17 +386,22 @@ bool fetchWeather() {
   if (configMutex) xSemaphoreGive(configMutex);
 
   WiFiClientSecure client; client.setInsecure(); HTTPClient https; https.setReuse(false);
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(hLat, 4) + "&longitude=" + String(hLon, 4) + "&current=temperature_2m,relative_humidity_2m,wind_speed_10m";
-  if (!https.begin(client, url)) return false;
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(hLat, 4) + "&longitude=" + String(hLon, 4) + "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code";
+  if (!https.begin(client, url)) { Serial.println("[weather] https.begin() failed"); return false; }
+  uint32_t t0 = millis();
   int code = https.GET();
+  Serial.printf("[weather] HTTP code=%d in %lums, heap=%u\n", code, millis() - t0, ESP.getFreeHeap());
   if (code != HTTP_CODE_OK) { https.end(); return false; }
   String payload = https.getString(); https.end();
 
-  JsonDocument doc; if (deserializeJson(doc, payload)) return false;
-  JsonObject c = doc["current"]; if (c.isNull()) return false;
-  
+  JsonDocument doc;
+  DeserializationError jerr = deserializeJson(doc, payload);
+  if (jerr) { Serial.printf("[weather] JSON parse failed: %s\n", jerr.c_str()); return false; }
+  JsonObject c = doc["current"]; if (c.isNull()) { Serial.println("[weather] no 'current' object"); return false; }
+
   weather.tempC = c["temperature_2m"] | 0.0f; weather.humidity = c["relative_humidity_2m"] | 0;
-  weather.windKmh = c["wind_speed_10m"] | 0.0f; weather.valid = true;
+  weather.windKmh = c["wind_speed_10m"] | 0.0f; weather.code = c["weather_code"] | 0; weather.valid = true;
+  Serial.printf("[weather] temp=%.1fC humidity=%d%% wind=%.1fkm/h code=%d\n", weather.tempC, weather.humidity, weather.windKmh, weather.code);
   return true;
 }
 
@@ -405,6 +442,80 @@ void drawArrow(int cx, int cy, int r, double angleDeg, uint16_t color) {
   tft.drawLine(tx, ty, tx + (int)(sin(right)* (r/2)), ty - (int)(cos(right)* (r/2)), color);
 }
 
+// Small heading-oriented plane glyph (fuselage + wings + tailfin) for radar blips
+void drawPlaneIcon(TFT_eSprite &spr, int cx, int cy, double headingDeg, uint16_t color) {
+  double h = deg2rad(headingDeg);
+  double sh = sin(h), ch = cos(h);
+  // Fuselage: nose to tail
+  int noseX = cx + (int)(sh * 5),  noseY = cy - (int)(ch * 5);
+  int tailX = cx - (int)(sh * 4),  tailY = cy + (int)(ch * 4);
+  spr.drawLine(tailX, tailY, noseX, noseY, color);
+  // Wings: perpendicular to heading, set slightly back from the nose
+  int wingCx = cx + (int)(sh * 1), wingCy = cy - (int)(ch * 1);
+  double pw = h + deg2rad(90);
+  int wLx = wingCx + (int)(sin(pw) * 4), wLy = wingCy - (int)(cos(pw) * 4);
+  int wRx = wingCx - (int)(sin(pw) * 4), wRy = wingCy + (int)(cos(pw) * 4);
+  spr.drawLine(wLx, wLy, wRx, wRy, color);
+  // Tailfin: small perpendicular stroke near the tail
+  int fLx = tailX + (int)(sin(pw) * 2), fLy = tailY - (int)(cos(pw) * 2);
+  int fRx = tailX - (int)(sin(pw) * 2), fRy = tailY + (int)(cos(pw) * 2);
+  spr.drawLine(fLx, fLy, fRx, fRy, color);
+}
+
+// Small cloud glyph, top-left anchored, ~20px wide x 10px tall
+void drawCloudShape(int x, int y, uint16_t color) {
+  tft.fillCircle(x + 5, y + 6, 4, color);
+  tft.fillCircle(x + 10, y + 4, 5, color);
+  tft.fillCircle(x + 15, y + 6, 4, color);
+  tft.fillRect(x + 3, y + 6, 14, 5, color);
+}
+
+// Maps an Open-Meteo WMO weather_code to a compact vector icon, top-left
+// anchored in a ~20x18px box.
+void drawWeatherIcon(int x, int y, int code) {
+  if (code == 0) {
+    // Clear sky: sun with rays
+    int cx = x + 9, cy = y + 8;
+    tft.fillCircle(cx, cy, 5, TFT_YELLOW);
+    for (int a = 0; a < 360; a += 45) {
+      double r = deg2rad(a);
+      tft.drawLine(cx + (int)(sin(r) * 7), cy - (int)(cos(r) * 7),
+                   cx + (int)(sin(r) * 10), cy - (int)(cos(r) * 10), TFT_YELLOW);
+    }
+  } else if (code >= 1 && code <= 3) {
+    // Mainly clear / partly cloudy / overcast: sun peeking behind a cloud
+    int cx = x + 5, cy = y + 4;
+    tft.fillCircle(cx, cy, 4, TFT_YELLOW);
+    drawCloudShape(x + 2, y + 5, TFT_LIGHTGREY);
+  } else if (code == 45 || code == 48) {
+    // Fog: stacked horizontal bands
+    for (int i = 0; i < 3; i++)
+      tft.drawFastHLine(x, y + 5 + i * 4, 18, TFT_LIGHTGREY);
+  } else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+    // Drizzle / rain / rain showers
+    drawCloudShape(x, y, TFT_LIGHTGREY);
+    for (int i = 0; i < 3; i++)
+      tft.drawLine(x + 4 + i * 5, y + 12, x + 2 + i * 5, y + 17, TFT_CYAN);
+  } else if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+    // Snow fall / snow showers
+    drawCloudShape(x, y, TFT_LIGHTGREY);
+    for (int i = 0; i < 3; i++) {
+      int sx = x + 4 + i * 5, sy = y + 15;
+      tft.drawLine(sx - 2, sy, sx + 2, sy, TFT_WHITE);
+      tft.drawLine(sx, sy - 2, sx, sy + 2, TFT_WHITE);
+    }
+  } else if (code >= 95) {
+    // Thunderstorm
+    drawCloudShape(x, y, TFT_DARKGREY);
+    tft.drawLine(x + 10, y + 11, x + 7, y + 16, TFT_YELLOW);
+    tft.drawLine(x + 7, y + 16, x + 11, y + 16, TFT_YELLOW);
+    tft.drawLine(x + 11, y + 16, x + 8, y + 21, TFT_YELLOW);
+  } else {
+    // Unknown/overcast fallback
+    drawCloudShape(x, y, TFT_LIGHTGREY);
+  }
+}
+
 void screenTargetIntel(bool newPage) {
   drawHeader("TARGET INTEL", newPage);
   tft.setTextPadding(300);
@@ -431,7 +542,7 @@ void screenTargetIntel(bool newPage) {
   
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   char buf[64];
-  snprintf(buf, sizeof(buf), "Country: %s", nearest.country);
+  snprintf(buf, sizeof(buf), "Type: %s", nearest.country);
   tft.drawString(buf, 20, 80);
   
   snprintf(buf, sizeof(buf), "Distance: %.1f km (%s)", nearest.distanceKm, compass(nearest.bearingDeg));
@@ -528,6 +639,24 @@ void screenRadar(bool newPage) {
   }
   tft.setTextPadding(0);
 
+  // Weather readout (icon + text) in the otherwise-empty space above the range indicator.
+  // Icon area is redrawn from a black-filled rect each frame — icon shapes vary in size/
+  // position by weather code, so (unlike text) there's no opaque-background auto-erase.
+  tft.fillRect(5, 128, 26, 26, TFT_BLACK);
+  if (weather.valid) drawWeatherIcon(8, 130, weather.code);
+
+  tft.setTextFont(1); tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.setTextPadding(110);
+  if (weather.valid) {
+    snprintf(buf, sizeof(buf), "%.1fC  %d%%RH", weather.tempC, weather.humidity);
+    tft.drawString(buf, 5, 158);
+    snprintf(buf, sizeof(buf), "Wind %.1f km/h", weather.windKmh);
+    tft.drawString(buf, 5, 173);
+  } else {
+    tft.drawString("Weather: --", 5, 158);
+    tft.drawString(" ", 5, 173);
+  }
+  tft.setTextPadding(0);
+
   const int cx = 100, cy = 100, R = 95;
   float elapsed = (millis() - lastDataMs) / 1000.0f;
 
@@ -560,8 +689,8 @@ void screenRadar(bool newPage) {
     int by = cy - (int)(cos(deg2rad(brg)) * rr);
 
     float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
-    if (behind < 30) radarSpr.fillCircle(bx, by, 3, TFT_YELLOW);
-    else radarSpr.fillRect(bx, by, 2, 2, TFT_GREEN);
+    uint16_t blipColor = (behind < 30) ? TFT_YELLOW : TFT_GREEN;
+    drawPlaneIcon(radarSpr, bx, by, blips[i].track, blipColor);
 
     // Draw callsign label in smallest legible font
     if (blips[i].callsign[0] && strcmp(blips[i].callsign, "(no id)") != 0) {
@@ -751,9 +880,9 @@ void initWebServer() {
   // GET / — serve config page
   server.on("/", []() {
     // Snapshot current values
-    double hLat, hLon, sRad; float rMax;
+    double hLat, hLon; float rMax; bool inv;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-    hLat = homeLat; hLon = homeLon; sRad = searchRadiusDeg; rMax = radarMaxKm;
+    hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors;
     if (configMutex) xSemaphoreGive(configMutex);
 
     String html = R"rawliteral(
@@ -771,6 +900,14 @@ void initWebServer() {
   button:hover{background:#00cc6a}
   .info{text-align:center;color:#666;font-size:0.8em;margin-top:12px}
   .saved{color:#00ff88;text-align:center;display:none;margin-top:8px}
+  .switch-row{display:flex;align-items:center;justify-content:space-between;margin:14px 0 4px}
+  .switch-row label{margin:0;color:#e0e0e0;font-size:1em}
+  .switch{position:relative;display:inline-block;width:46px;height:24px;flex-shrink:0}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#333;border-radius:24px;transition:.2s}
+  .slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+  input:checked + .slider{background:#00ff88}
+  input:checked + .slider:before{transform:translateX(22px)}
 </style></head><body>
 <h1>&#9992; CYD Plane Spotter</h1>
 <div class="card">
@@ -779,10 +916,15 @@ void initWebServer() {
     <input type="number" step="any" name="lat" id="lat" value=")rawliteral" + String(hLat, 6) + R"rawliteral(" required>
     <label>Home Longitude (&deg;)</label>
     <input type="number" step="any" name="lon" id="lon" value=")rawliteral" + String(hLon, 6) + R"rawliteral(" required>
-    <label>Search Radius (&deg;)</label>
-    <input type="number" step="any" name="radius" id="radius" value=")rawliteral" + String(sRad, 4) + R"rawliteral(" required>
-    <label>Radar Max Range (km)</label>
+    <label>Radar Max Range (km) &mdash; also sets data fetch radius</label>
     <input type="number" step="any" name="range" id="range" value=")rawliteral" + String(rMax, 1) + R"rawliteral(" required>
+    <div class="switch-row">
+      <label for="dark">Dark Mode</label>
+      <label class="switch">
+        <input type="checkbox" id="dark")rawliteral" + String(inv ? "" : " checked") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
     <button type="submit">Save Settings</button>
   </form>
   <div class="saved" id="msg">&#10003; Settings saved!</div>
@@ -800,8 +942,8 @@ function save(e){
   };
   x.send('lat='+encodeURIComponent(document.getElementById('lat').value)+
          '&lon='+encodeURIComponent(document.getElementById('lon').value)+
-         '&radius='+encodeURIComponent(document.getElementById('radius').value)+
-         '&range='+encodeURIComponent(document.getElementById('range').value));
+         '&range='+encodeURIComponent(document.getElementById('range').value)+
+         '&dark='+(document.getElementById('dark').checked?'1':'0'));
 }
 </script></body></html>)rawliteral";
 
@@ -810,19 +952,19 @@ function save(e){
 
   // POST /save — persist new config
   server.on("/save", []() {
-    if (!server.hasArg("lat") || !server.hasArg("lon") || !server.hasArg("radius") || !server.hasArg("range")) {
+    if (!server.hasArg("lat") || !server.hasArg("lon") || !server.hasArg("range")) {
       server.send(400, "text/plain", "Missing fields");
       return;
     }
 
     double newLat = server.arg("lat").toDouble();
     double newLon = server.arg("lon").toDouble();
-    double newRad = server.arg("radius").toDouble();
     float  newRng = server.arg("range").toFloat();
+    bool   newInvert = server.hasArg("dark") ? (server.arg("dark") != "1") : invertColors;
 
     // Basic validation
     if (newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180 ||
-        newRad <= 0 || newRad > 10 || newRng <= 0 || newRng > 500) {
+        newRng <= 0 || newRng > 500) {
       server.send(400, "text/plain", "Invalid values");
       return;
     }
@@ -831,18 +973,19 @@ function save(e){
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     homeLat = newLat;
     homeLon = newLon;
-    searchRadiusDeg = newRad;
     radarMaxKm = newRng;
+    invertColors = newInvert;
     if (configMutex) xSemaphoreGive(configMutex);
+    tft.invertDisplay(newInvert);
 
     // Persist to NVS
     prefs.putDouble("lat", newLat);
     prefs.putDouble("lon", newLon);
-    prefs.putDouble("radius", newRad);
     prefs.putFloat("range", newRng);
+    prefs.putBool("invert", newInvert);
 
-    Serial.printf("Config saved: lat=%.6f lon=%.6f radius=%.4f range=%.1f\n",
-                  newLat, newLon, newRad, newRng);
+    Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d\n",
+                  newLat, newLon, newRng, newInvert);
     server.send(200, "text/plain", "OK");
   });
 
@@ -861,9 +1004,8 @@ void setup() {
   ts.setRotation(1);
 
   tft.begin();
-  tft.setRotation(1); 
-  tft.invertDisplay(false); 
-  
+  tft.setRotation(1);
+
   radarSpr.setColorDepth(16);
   radarSpr.createSprite(200, 200);
 
@@ -886,10 +1028,11 @@ void setup() {
   prefs.begin("cyd-spotter", false);
   homeLat = prefs.getDouble("lat", homeLat);
   homeLon = prefs.getDouble("lon", homeLon);
-  searchRadiusDeg = prefs.getDouble("radius", searchRadiusDeg);
   radarMaxKm = prefs.getFloat("range", radarMaxKm);
-  Serial.printf("Config loaded: lat=%.6f lon=%.6f radius=%.4f range=%.1f\n",
-                homeLat, homeLon, searchRadiusDeg, radarMaxKm);
+  invertColors = prefs.getBool("invert", invertColors);
+  tft.invertDisplay(invertColors);
+  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d\n",
+                homeLat, homeLon, radarMaxKm, invertColors);
 
   // Create mutexes before the task (task uses them)
   dataMutex = xSemaphoreCreateMutex();

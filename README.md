@@ -21,7 +21,7 @@ A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that r
 
 | Source | Purpose |
 |--------|---------|
-| [OpenSky Network](https://opensky-network.org/) | Real-time ADS-B aircraft states |
+| [adsb.lol](https://api.adsb.lol/) | Real-time ADS-B aircraft states (free, keyless — swapped from OpenSky due to persistent anonymous-tier 429s) |
 | [hexdb.io](https://hexdb.io/) | ICAO hex → route lookup (departure/arrival airports) |
 | [Open-Meteo](https://open-meteo.com/) | Weather (temperature, humidity, wind speed) |
 
