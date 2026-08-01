@@ -1,6 +1,6 @@
 # CYD28 Plane Spotter ✈️
 
-A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that renders a live radar PPI (Plan Position Indicator), shows nearby aircraft details, and provides weather & system status — all on a 2.8" 240×320 TFT touchscreen.
+A real-time aircraft tracker that renders a live radar PPI (Plan Position Indicator), shows nearby aircraft details, and provides weather & system status. Supports two boards from one codebase: the **ESP32 Cheap Yellow Display (CYD)** (2.8" 240×320, full 5-screen UI) and the **JC4832W535** (ESP32-S3, 3.5" 480×320 QSPI display — currently a minimal hardware bring-up, not yet the full UI; see Roadmap).
 
 ## Changes from Upstream
 
@@ -14,6 +14,7 @@ This is a fork of [ppoinha/CYD28PlaneSpotter](https://github.com/ppoinha/CYD28Pl
 - **Fully configurable radar blip labels** — every field (flight number, altitude, route, airline, registration, squawk, vertical rate, aircraft type, speed) is its own independent on/off switch on the web config page. Nothing is forced on; if everything's off, no label draws at all.
 - **Route + airline data: hexdb.io → adsbdb.com** — switched the per-aircraft lookup to [adsbdb.com](https://api.adsbdb.com/)'s `/v0/callsign/{callsign}` endpoint, which returns the airline name and both origin/destination airport **IATA** codes (e.g. `ICN`, not the ICAO code `RKSI`) in a single call — faster (~1s vs. hexdb.io's 2-3s) and better data than the two sources (plus a static ICAO→IATA table) this used to require. A small local airline-code table is kept only as a fallback for the rare callsign adsbdb.com doesn't recognize.
 - **Diagnostic logging** — HTTP status/timing/heap logging around the aircraft fetch, route/airline lookup, and weather calls, added while debugging the original OpenSky failures and left in intentionally for ongoing visibility.
+- **Second board: JC4832W535** — `main.cpp` split into a board-agnostic data layer (`shared.h`/`data.cpp`) and per-board rendering (`display_cyd.cpp` for the original TFT_eSPI/CYD code, `display_jc4832.cpp` new), selected via separate PlatformIO environments (`pio run -e cyd` / `-e jc4832`). The JC4832W535 uses a QSPI/AXS15231B display TFT_eSPI can't drive at all, so it runs on Arduino_GFX instead — a genuinely different display library, not a config change.
 
 ## Design Decisions
 
@@ -29,9 +30,11 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 
 - **The flash budget shaped what "comprehensive" could mean.** This board has roughly 270KB of flash headroom. A truly exhaustive airline/airport dataset (the kind OpenFlights or a full ICAO registry provides — thousands of entries covering every charter operator and small airfield) doesn't fit. The fallback tables here are intentionally scoped to major, verified entries rather than attempting full global coverage locally — real global coverage instead comes from the live adsbdb.com lookup, with the local table only covering its gaps.
 
-- **A much larger, verified dataset exists in the source but isn't wired up.** `src/main.cpp` also contains `AIRLINE_CODES_FULL` (303 entries) and `AIRPORT_CODES_ICAO_IATA` (319 entries) — sourced from raw Wikipedia airline/airport code wikitext, parsed directly and cross-checked entry by entry (not summarized, after an early summarizer pass hallucinated a wrong code). Neither is referenced by any function, so the linker's dead-code elimination strips both entirely — confirmed via the linked binary's symbol table, flash usage is byte-identical with or without them present. `AIRLINE_CODES_FULL` is a straightforward drop-in upgrade for the active fallback table (~6.9KB once wired up) whenever broader offline coverage is wanted. `AIRPORT_CODES_ICAO_IATA` (~5.3KB) currently has no use case — the only code path that needed ICAO→IATA conversion was the old hexdb.io route lookup, which adsbdb.com's direct IATA codes made obsolete — it'd only become useful again alongside a secondary/backup route data source.
+- **A much larger, verified dataset exists in the source but isn't wired up.** `src/data.cpp` also contains `AIRLINE_CODES_FULL` (303 entries) and `AIRPORT_CODES_ICAO_IATA` (319 entries) — sourced from raw Wikipedia airline/airport code wikitext, parsed directly and cross-checked entry by entry (not summarized, after an early summarizer pass hallucinated a wrong code). Neither is referenced by any function, so the linker's dead-code elimination strips both entirely — confirmed via the linked binary's symbol table, flash usage is byte-identical with or without them present. `AIRLINE_CODES_FULL` is a straightforward drop-in upgrade for the active fallback table (~6.9KB once wired up) whenever broader offline coverage is wanted. `AIRPORT_CODES_ICAO_IATA` (~5.3KB) currently has no use case — the only code path that needed ICAO→IATA conversion was the old hexdb.io route lookup, which adsbdb.com's direct IATA codes made obsolete — it'd only become useful again alongside a secondary/backup route data source.
 
 - **Two permanent sprites, not one resized on the fly.** The Radar Full screen originally shared `radarSpr` with the small Radar PPI screen, resizing it (`deleteSprite()` + `createSprite()`) on every transition between the two screens rather than permanently reserving memory for both sizes at once. In practice this fragmented the heap badly enough that later allocations silently failed — both radar screens stopped drawing at all, and shortly after, TLS/HTTPS itself started failing with `X509 - Allocation of memory failed`. Fixed by allocating two separate sprites once at boot and never freeing either — `radarSpr` (200×200) and `radarSprFull` (234×234), both switched from 16-bit to 8-bit color to keep their combined footprint small enough to leave real headroom for WiFi/TLS buffers. Verified with 30+ seconds of continuous successful HTTPS calls afterward, no further allocation failures. On a single-heap, no-PSRAM board like this one, permanent fixed-size allocations made once at boot are more predictable than repeated resize/free cycles at runtime, even though they use somewhat more memory at rest.
+
+- **JC4832W535 bring-up needed native resolution + software rotation, not the panel's marketed landscape dimensions.** Telling the AXS15231B driver its native resolution was 480×320 (this board's marketed spec) directly produced a garbled bottom third of the screen — data was reaching the panel, but column/row addressing was wrong. The only proven-working reference found for this chip family (the sibling JC3248W535 board) instead keeps the driver at its electrical native 320×480 and reaches landscape via software `setRotation(1)`. Matching that exactly fixed it. Also required pinning `Arduino_GFX` to `1.4.5` — newer releases assume ESP32 Arduino core 3.x's `esp32-hal-periman.h`, which the core 2.0.14 both environments currently use doesn't have; this only affects the `jc4832` environment; the CYD's `TFT_eSPI` toolchain is untouched.
 
 ## Features
 
@@ -45,9 +48,15 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 
 ## Hardware
 
+**CYD (`env:cyd`)** — full 5-screen UI
 - **Board**: ESP32-2432S028 (CYD28) — 2.8" TFT with ILI9341 driver
 - **Touch**: XPT2046 resistive touch controller
 - **Display**: 240×320 pixels, rotation 1 (landscape)
+
+**JC4832W535 (`env:jc4832`)** — minimal bring-up (WiFi/aircraft-count/nearest-callsign screen; full UI is a Roadmap item)
+- **Board**: ESP32-S3-WROOM-1-N16R8 (16MB flash, 8MB PSRAM), Guition JC4832W535
+- **Display**: AXS15231B over QSPI, native 320×480, software-rotated to 480×320 landscape
+- **Touch**: AXS15231B integrated capacitive touch over I2C (vendored driver, `src/AXS15231B_touch.{h,cpp}`)
 
 ## Data Sources
 
@@ -61,13 +70,20 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 
 ```
 CYD28/
-├── platformio.ini          # PlatformIO build configuration
+├── platformio.ini          # [env:cyd] and [env:jc4832] build configuration
 ├── config.env.example      # Configuration template (copy to config.env)
+├── boards/
+│   └── esp32-s3-n16r8v.json  # Custom board def for the JC4832W535's ESP32-S3 module
 ├── .gitignore
 ├── README.md
 └── src/
-    ├── main.cpp            # Main application code
-    └── config.env          # Your private config (gitignored)
+    ├── main.cpp             # Board-agnostic entry point (setup/loop only)
+    ├── shared.h              # Structs, config globals, math helpers, board interface
+    ├── data.cpp               # WiFi, adsb.lol/adsbdb.com/weather fetching, web config server
+    ├── display_cyd.cpp        # CYD-only: TFT_eSPI rendering + XPT2046 touch
+    ├── display_jc4832.cpp     # JC4832W535-only: Arduino_GFX rendering + I2C touch
+    ├── AXS15231B_touch.{h,cpp}  # Vendored touch driver for the JC4832W535
+    └── config.env            # Your private config (gitignored)
 ```
 
 ## Setup
@@ -88,11 +104,13 @@ CYD28/
    #define DEFAULT_HOME_LAT      47.5774   // your latitude
    #define DEFAULT_HOME_LON      8.5212    // your longitude
    ```
-5. **Build & upload**:
+5. **Build & upload** — specify which board:
    ```
-   pio run --target upload
+   pio run -e cyd -t upload      # CYD (ESP32-2432S028)
+   pio run -e jc4832 -t upload   # JC4832W535 (ESP32-S3)
    ```
-6. Once connected, find the device IP in the serial monitor and open it in a browser to change settings live.
+   Both boards share `src/config.env` — no per-board config needed.
+6. Once connected, find the device IP in the serial monitor and open it in a browser to change settings live (CYD only, currently — the JC4832W535's web server runs too, but there's no on-screen UI yet to reflect the settings back).
 
 ## Usage
 
@@ -105,14 +123,22 @@ CYD28/
 Ideas noted for future work, not yet implemented:
 
 - **Arrivals/departures board per nearby airport** — a dedicated screen (one per airport, e.g. GMP and ICN for the primary dev setup) listing upcoming arrivals and departures at that specific airport, rather than the existing Top 5/Target Intel screens which are organized by distance from home location instead of by airport.
+- **Full UI port to the JC4832W535** — `display_jc4832.cpp` currently only proves the hardware pipeline works (display, touch, WiFi, shared data layer). Porting the CYD's 5-screen UI (radar PPI, toggleable blip labels, Target Intel, Top 5, Weather & System) to this board's different resolution and aspect ratio (480×320 vs. 320×240) is real, sizable follow-up work — every screen's layout needs re-deriving, not just recompiling.
+- **On-hardware touch calibration for the JC4832W535** — the current touch offsets are a placeholder spanning the full native panel range; `checkTouch()` logs raw coordinates to Serial specifically so real calibration data can be gathered and the offsets tuned.
 
 ## Dependencies
 
+**CYD (`env:cyd`)**
 - [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI) — TFT display driver
-- [ArduinoJson](https://arduinojson.org/) — JSON parsing
 - [XPT2046_Touchscreen](https://github.com/PaulStoffregen/XPT2046_Touchscreen) — Touch controller
 
-All managed automatically via PlatformIO `lib_deps`.
+**JC4832W535 (`env:jc4832`)**
+- [Arduino_GFX](https://github.com/moononournation/Arduino_GFX) — pinned to `1.4.5`; newer releases require ESP32 Arduino core 3.x, which this project doesn't currently use (see Design Decisions)
+
+**Both**
+- [ArduinoJson](https://arduinojson.org/) — JSON parsing
+
+All managed automatically via PlatformIO `lib_deps`, per environment.
 
 ## License
 
