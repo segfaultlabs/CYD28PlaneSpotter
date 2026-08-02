@@ -21,15 +21,20 @@ public:
     bool begin();
     bool touched();
     void readData(uint16_t *x, uint16_t *y);
+    String dumpDebug();  // recent status-register polls, for the /gt911debug HTTP route
 
 private:
     uint8_t intPin;
     IOExtension &io;
     uint16_t lastX = 0, lastY = 0;
 
+    static const uint8_t DEBUG_LOG_SIZE = 100;  // 100 * 300ms poll interval = 30s of history
+    uint8_t debugLog[DEBUG_LOG_SIZE] = {0};
+    uint8_t debugLogPos = 0;
+
     uint8_t readReg8(uint16_t reg);
     void writeReg8(uint16_t reg, uint8_t value);
-    void readRegN(uint16_t reg, uint8_t *buf, uint8_t len);
+    uint8_t readRegN(uint16_t reg, uint8_t *buf, uint8_t len);  // returns bytes actually read
 };
 
 #endif
