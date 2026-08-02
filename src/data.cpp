@@ -10,6 +10,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Update.h>
 #include "config.env"
 
 // ---------------------------------------------------------------------------
@@ -715,6 +716,14 @@ void initWebServer() {
   </form>
   <div class="saved" id="msg">&#10003; Settings saved!</div>
 </div>
+<div class="card">
+  <h2 style="color:#00ff88;font-size:1em;margin:0 0 8px">Firmware Update</h2>
+  <form id="ota" onsubmit="return doOta(event)">
+    <input type="file" id="fw" accept=".bin" required style="width:100%;box-sizing:border-box;margin:6px 0;color:#e0e0e0">
+    <button type="submit">Upload &amp; Flash</button>
+  </form>
+  <div id="otaMsg" style="text-align:center;margin-top:8px;font-size:0.85em;color:#aaa"></div>
+</div>
 <div class="info">IP: )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
 function save(e){
@@ -740,6 +749,25 @@ function save(e){
          '&vrate='+(document.getElementById('vrate').checked?'1':'0')+
          '&type='+(document.getElementById('type').checked?'1':'0')+
          '&tables='+(document.getElementById('tables').checked?'1':'0'));
+}
+function doOta(e){
+  e.preventDefault();
+  var f=document.getElementById('fw').files[0];
+  if(!f) return false;
+  if(!confirm('Upload '+f.name+' and reboot the device? Make sure this .bin was built for this exact board.')) return false;
+  var fd=new FormData();
+  fd.append('update', f);
+  var x=new XMLHttpRequest();
+  x.open('POST','/update',true);
+  document.getElementById('otaMsg').textContent='Uploading...';
+  x.onload=function(){
+    document.getElementById('otaMsg').textContent = x.status==200 ? x.responseText : ('Upload failed: '+x.responseText);
+  };
+  x.onerror=function(){
+    document.getElementById('otaMsg').textContent='Upload error';
+  };
+  x.send(fd);
+  return false;
 }
 </script></body></html>)rawliteral";
 
@@ -814,6 +842,40 @@ function save(e){
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,
                   newShowRoute, newShowReg, newShowSquawk, newShowVRate, newShowType, newPreferTables);
     server.send(200, "text/plain", "OK");
+  });
+
+  // POST /update — OTA firmware upload (multipart file upload). This flashes
+  // whatever .bin is uploaded into the inactive OTA app slot and reboots into
+  // it — there's no board-identity check, since the firmware itself has no
+  // reliable way to know what board a .bin was built for before flashing it.
+  // The web UI confirm() dialog is the only guard.
+  server.on("/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    if (Update.hasError()) {
+      server.send(200, "text/plain", "Update failed, still running old firmware");
+    } else {
+      server.send(200, "text/plain", "Update OK, rebooting...");
+    }
+    delay(500);
+    ESP.restart();
+  }, []() {
+    HTTPUpload &upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("[ota] Update start: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("[ota] Update success: %u bytes\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    }
   });
 
   server.begin();

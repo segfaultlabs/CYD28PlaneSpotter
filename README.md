@@ -52,6 +52,7 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 - **Top 5 In Range** — scrollable list of the 5 closest flights with route and altitude info.
 - **Weather & System** — live temperature, humidity, and wind from Open-Meteo, plus system stats (uptime, WiFi RSSI, free RAM, API request counters).
 - **Web Configuration** — built-in web server to change home location, radar range, and dark mode from any browser on the same network.
+- **Over-the-air firmware updates** — a "Firmware Update" upload form on the same web config page flashes a new `.bin` over WiFi (`POST /update`, backed by the standard ESP32 `Update` library) and reboots into it — no USB cable needed after the first flash. Works identically on all three boards, since it's part of the shared `data.cpp` web server.
 - **Dual-core architecture** — HTTP/API calls run on Core 0 (FreeRTOS task), UI rendering and touch handling run on Core 1, keeping the display smooth.
 
 ## Hardware
@@ -134,6 +135,7 @@ CYD28/
 - **Tap the screen** to cycle through the 5 screens (Target Intel → Top 5 → Radar PPI → Radar Full → Weather & System).
 - **On the Radar screen**, tap the **+/- buttons** at the bottom-left to adjust range (10–200 km) — this also sets the aircraft data fetch radius.
 - **Open the device IP** in a browser to configure location, range, Dark Mode, and which fields show on radar blip labels.
+- **Firmware updates over WiFi** — same page, "Firmware Update" card: pick a `.bin` built via `pio run -e <board>` (from `.pio/build/<board>/firmware.bin` — the plain app binary, not a merged image) and upload. The device flashes it into the inactive OTA slot and reboots. There's no board-identity check on the uploaded file, so double-check you're uploading the right board's build.
 
 ## Roadmap
 
