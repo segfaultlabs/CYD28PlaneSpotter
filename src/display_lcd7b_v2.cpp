@@ -132,11 +132,7 @@ static const int RADAR_R = 260;
 // between fetch cycles — a trail must follow one aircraft, not one array
 // slot. Lives here (not shared.h/data.cpp) since it's purely a rendering
 // concern local to this board's Radar screen.
-// TRAIL_LEN=6 initially made trails invisible: sampled once per "full" radar
-// redraw (~600ms), so 6 points was only ~3.6s of history -- barely a smear,
-// not a trail. 24 points covers ~14.4s, close to TRAIL_STALE_MS, so a trail
-// stays populated right up until it's actually evicted.
-#define TRAIL_LEN 24
+#define TRAIL_LEN 6
 #define TRAIL_SLOTS MAX_BLIPS
 #define TRAIL_STALE_MS 15000  // drop a trail if its aircraft hasn't been seen in this long
 struct TrailHistory {
