@@ -129,16 +129,6 @@ CYD28/
    All three boards share `src/config.env` — no per-board config needed.
 6. Once connected, find the device IP in the serial monitor and open it in a browser to change settings live (CYD and JC4832W535 reflect settings back on-screen; the LCD-7B's web server runs too, but there's no on-screen UI yet to reflect the settings back — see Roadmap).
 
-## Web Flashing
-
-Prebuilt firmware can be flashed directly from a browser (Chrome/Edge, desktop, WebSerial) at **[segfaultlabs.github.io/CYD28PlaneSpotter](https://segfaultlabs.github.io/CYD28PlaneSpotter/)** — no PlatformIO install needed. This flashes whatever WiFi credentials/home location were baked into `src/config.env` when the published binaries were last built; to flash your own credentials, use the PlatformIO CLI flow above instead.
-
-The published binaries (`docs/firmware/*.bin`) are merged, flash-ready images (bootloader + partition table + app, via `esptool.py merge_bin`) and are **not** rebuilt automatically — after any firmware change intended for the web installer, rebuild and recommit them manually:
-```
-pio run -e cyd && pio run -e jc4832 && pio run -e lcd7b
-# then esptool.py merge_bin for each (see git history for the exact invocation)
-```
-
 ## Usage
 
 - **Tap the screen** to cycle through the 5 screens (Target Intel → Top 5 → Radar PPI → Radar Full → Weather & System).
