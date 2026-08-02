@@ -32,6 +32,7 @@ extern bool   showReg;
 extern bool   showSquawk;
 extern bool   showVRate;
 extern bool   showType;
+extern bool   showTraces;  // radar flight-path trails, off by default like the rest
 // When true (default): if Airline is on but Route is off, resolve the airline name
 // entirely from the local AIRLINE_CODES_FULL table and skip calling adsbdb.com for
 // that aircraft — route data can't come from a static table (it's flight-specific,

@@ -42,11 +42,12 @@ void setup() {
   showSquawk = prefs.getBool("squawk", showSquawk);
   showVRate = prefs.getBool("vrate", showVRate);
   showType = prefs.getBool("type", showType);
+  showTraces = prefs.getBool("traces", showTraces);
   preferLocalTables = prefs.getBool("tables", preferLocalTables);
   applyInvertColors(invertColors);
-  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d tables=%d\n",
+  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
                 homeLat, homeLon, radarMaxKm, invertColors, showCallsign, showAirline, showSpeed, showFL,
-                showRoute, showReg, showSquawk, showVRate, showType, preferLocalTables);
+                showRoute, showReg, showSquawk, showVRate, showType, showTraces, preferLocalTables);
 
   // Create mutexes before the task (task uses them)
   dataMutex = xSemaphoreCreateMutex();

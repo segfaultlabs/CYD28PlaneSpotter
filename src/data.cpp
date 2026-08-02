@@ -29,6 +29,7 @@ bool   showReg = false;
 bool   showSquawk = false;
 bool   showVRate = false;
 bool   showType = false;
+bool   showTraces = false;
 bool   preferLocalTables = true;
 
 SemaphoreHandle_t configMutex = NULL;
@@ -593,11 +594,11 @@ void initWebServer() {
   server.on("/", []() {
     // Snapshot current values
     double hLat, hLon; float rMax; bool inv;
-    bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy, preferTables;
+    bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy, showTr, preferTables;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors;
     showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
-    showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType; preferTables = preferLocalTables;
+    showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType; showTr = showTraces; preferTables = preferLocalTables;
     if (configMutex) xSemaphoreGive(configMutex);
 
     String html = R"rawliteral(
@@ -706,6 +707,13 @@ void initWebServer() {
       </label>
     </div>
     <div class="switch-row">
+      <label for="traces">Radar Flight Path Traces</label>
+      <label class="switch">
+        <input type="checkbox" id="traces")rawliteral" + String(showTr ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
       <label for="tables">Prefer Local Tables (fewer API calls)</label>
       <label class="switch">
         <input type="checkbox" id="tables")rawliteral" + String(preferTables ? " checked" : "") + R"rawliteral(>
@@ -748,6 +756,7 @@ function save(e){
          '&squawk='+(document.getElementById('squawk').checked?'1':'0')+
          '&vrate='+(document.getElementById('vrate').checked?'1':'0')+
          '&type='+(document.getElementById('type').checked?'1':'0')+
+         '&traces='+(document.getElementById('traces').checked?'1':'0')+
          '&tables='+(document.getElementById('tables').checked?'1':'0'));
 }
 function doOta(e){
@@ -794,6 +803,7 @@ function doOta(e){
     bool   newShowSquawk = server.hasArg("squawk") ? (server.arg("squawk") == "1") : showSquawk;
     bool   newShowVRate = server.hasArg("vrate") ? (server.arg("vrate") == "1") : showVRate;
     bool   newShowType = server.hasArg("type") ? (server.arg("type") == "1") : showType;
+    bool   newShowTraces = server.hasArg("traces") ? (server.arg("traces") == "1") : showTraces;
     bool   newPreferTables = server.hasArg("tables") ? (server.arg("tables") == "1") : preferLocalTables;
 
     // Basic validation
@@ -818,6 +828,7 @@ function doOta(e){
     showSquawk = newShowSquawk;
     showVRate = newShowVRate;
     showType = newShowType;
+    showTraces = newShowTraces;
     preferLocalTables = newPreferTables;
     if (configMutex) xSemaphoreGive(configMutex);
     applyInvertColors(newInvert);
@@ -836,11 +847,12 @@ function doOta(e){
     prefs.putBool("squawk", newShowSquawk);
     prefs.putBool("vrate", newShowVRate);
     prefs.putBool("type", newShowType);
+    prefs.putBool("traces", newShowTraces);
     prefs.putBool("tables", newPreferTables);
 
-    Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d tables=%d\n",
+    Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,
-                  newShowRoute, newShowReg, newShowSquawk, newShowVRate, newShowType, newPreferTables);
+                  newShowRoute, newShowReg, newShowSquawk, newShowVRate, newShowType, newShowTraces, newPreferTables);
     server.send(200, "text/plain", "OK");
   });
 
