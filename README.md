@@ -1,6 +1,6 @@
 # CYD28 Plane Spotter ✈️
 
-A real-time aircraft tracker that renders a live radar PPI (Plan Position Indicator), shows nearby aircraft details, and provides weather & system status. Supports two boards from one codebase: the **ESP32 Cheap Yellow Display (CYD)** (2.8" 240×320, full 5-screen UI) and the **JC4832W535** (ESP32-S3, 3.5" 480×320 QSPI display — currently a minimal hardware bring-up, not yet the full UI; see Roadmap).
+A real-time aircraft tracker that renders a live radar PPI (Plan Position Indicator), shows nearby aircraft details, and provides weather & system status. Supports three boards from one codebase: the **ESP32 Cheap Yellow Display (CYD)** (2.8" 240×320, full 5-screen UI), the **JC4832W535** (ESP32-S3, 3.5" 480×320 QSPI display, full 4-screen UI), and the **ESP32-S3-Touch-LCD-7B** (Waveshare, ESP32-S3, 7" 1024×600 RGB-parallel display — currently a minimal hardware bring-up, not yet the full UI; see Roadmap).
 
 ## Changes from Upstream
 
@@ -15,6 +15,8 @@ This is a fork of [ppoinha/CYD28PlaneSpotter](https://github.com/ppoinha/CYD28Pl
 - **Route + airline data: hexdb.io → adsbdb.com** — switched the per-aircraft lookup to [adsbdb.com](https://api.adsbdb.com/)'s `/v0/callsign/{callsign}` endpoint, which returns the airline name and both origin/destination airport **IATA** codes (e.g. `ICN`, not the ICAO code `RKSI`) in a single call — faster (~1s vs. hexdb.io's 2-3s) and better data than the two sources (plus a static ICAO→IATA table) this used to require. A small local airline-code table is kept only as a fallback for the rare callsign adsbdb.com doesn't recognize.
 - **Diagnostic logging** — HTTP status/timing/heap logging around the aircraft fetch, route/airline lookup, and weather calls, added while debugging the original OpenSky failures and left in intentionally for ongoing visibility.
 - **Second board: JC4832W535** — `main.cpp` split into a board-agnostic data layer (`shared.h`/`data.cpp`) and per-board rendering (`display_cyd.cpp` for the original TFT_eSPI/CYD code, `display_jc4832.cpp` new), selected via separate PlatformIO environments (`pio run -e cyd` / `-e jc4832`). The JC4832W535 uses a QSPI/AXS15231B display TFT_eSPI can't drive at all, so it runs on Arduino_GFX instead — a genuinely different display library, not a config change.
+- **Full UI port to the JC4832W535** — `display_jc4832.cpp` now implements the same Target Intel / Top 5 / Radar / Weather & System screen set as the CYD, ported to Arduino_GFX (no sprites — a single full-panel `Arduino_Canvas`, `setCursor()+print()` instead of `drawString()`, `getTextBounds()` instead of `textWidth()`/`fontHeight()`) and laid out fresh for the 480×320 canvas. The CYD's two separate radar variants (compact "Radar PPI" + borderless "Radar Full") are consolidated into one bigger Radar screen here, since this board's wider canvas doesn't have the space constraint that motivated splitting them on the CYD.
+- **Third board: ESP32-S3-Touch-LCD-7B** — a Waveshare 7" 1024×600 board added the same way (`display_lcd7b.cpp`, `pio run -e lcd7b`). Unlike the other two boards, this one's ST7701 panel is direct RGB-parallel (no QSPI/SPI command interface at all), and touch reset/backlight run through a small I2C GPIO-expander rather than direct GPIOs. Currently a minimal bring-up (see Roadmap for the full UI port).
 
 ## Design Decisions
 
@@ -36,6 +38,12 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 
 - **JC4832W535 bring-up needed native resolution + software rotation, not the panel's marketed landscape dimensions.** Telling the AXS15231B driver its native resolution was 480×320 (this board's marketed spec) directly produced a garbled bottom third of the screen — data was reaching the panel, but column/row addressing was wrong. The only proven-working reference found for this chip family (the sibling JC3248W535 board) instead keeps the driver at its electrical native 320×480 and reaches landscape via software `setRotation(1)`. Matching that exactly fixed it. Also required pinning `Arduino_GFX` to `1.4.5` — newer releases assume ESP32 Arduino core 3.x's `esp32-hal-periman.h`, which the core 2.0.14 both environments currently use doesn't have; this only affects the `jc4832` environment; the CYD's `TFT_eSPI` toolchain is untouched.
 
+- **The JC4832W535's Radar PPI and Radar Full became one screen, not two.** The CYD has both because its 320×240 canvas is too tight for one radar view to have both a header and a large circle at once. The JC4832W535's 480×320 canvas doesn't have that constraint, so porting both variants over would have just replicated a CYD-specific workaround rather than done "the full port" in spirit — one Radar screen here has both a header and a bigger circle (R=145) than either CYD variant achieves.
+
+- **ESP32-S3-Touch-LCD-7B bring-up was built from the vendor's own reference code, not guessed pin/timing values.** This board's ST7701 panel is direct RGB-parallel — 16 data lines plus HSYNC/VSYNC/DE/PCLK, no command interface, no forgiving fallback the way a wrong QSPI init just fails cleanly. Guessing here risked repeating the JC4832W535's garbled-display bug, so every pin and timing value in `display_lcd7b.cpp` was sourced directly from Waveshare's own official example repo (`waveshareteam/ESP32-S3-Touch-LCD-7B`) rather than assumption. Two findings from that reference shaped the implementation: the panel needs **no vendor init sequence at all** (Waveshare's own code calls the raw ESP-IDF RGB panel API with no ST7701 register writes — it self-configures into RGB passthrough, matched here via Arduino_GFX's `Arduino_RGB_Display` in its "bare" mode), and touch reset/backlight run through a small I2C GPIO-expander (`IOExtension`, addr `0x24`) rather than direct GPIOs, discovered from the vendor's `io_extension.c`. Even sourced correctly, the first flash produced a flickering/rolling "bad TV channel" image — turned out `Arduino_ESP32RGBPanel`'s `hsync_polarity`/`vsync_polarity` params map *inverted* to the underlying ESP-IDF `hsync_idle_low`/`vsync_idle_low` flags; the vendor's example implicitly leaves those flags at `0` by never setting them, which requires `polarity=1` on the Arduino_GFX side, not `0` as the naming suggests.
+
+- **GT911 touch on the LCD-7B is a hand-rolled driver, not the vendor's `gt911.cpp`.** That file turned out to be the generic ESP-IDF `esp_lcd_touch_gt911` component — sleep modes, interrupt callbacks, and other machinery this project doesn't need. Instead `GT911_touch.{h,cpp}` implements just the well-documented public GT911 register map (status at `0x814E`, point data from `0x8150`) directly over `Wire`, matching the project's existing pattern for the JC4832W535's `AXS15231B_touch.{h,cpp}`.
+
 ## Features
 
 - **Radar PPI** — rotating sweep line with aircraft blips; each label's fields (callsign, altitude, route, airline, registration, squawk, vertical rate, aircraft type, speed) are independently toggleable from the web config page. Configurable range with on-screen +/- buttons.
@@ -53,10 +61,15 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 - **Touch**: XPT2046 resistive touch controller
 - **Display**: 240×320 pixels, rotation 1 (landscape)
 
-**JC4832W535 (`env:jc4832`)** — minimal bring-up (WiFi/aircraft-count/nearest-callsign screen; full UI is a Roadmap item)
+**JC4832W535 (`env:jc4832`)** — full 4-screen UI (Target Intel, Top 5, Radar, Weather & System)
 - **Board**: ESP32-S3-WROOM-1-N16R8 (16MB flash, 8MB PSRAM), Guition JC4832W535
 - **Display**: AXS15231B over QSPI, native 320×480, software-rotated to 480×320 landscape
 - **Touch**: AXS15231B integrated capacitive touch over I2C (vendored driver, `src/AXS15231B_touch.{h,cpp}`)
+
+**ESP32-S3-Touch-LCD-7B (`env:lcd7b`)** — minimal bring-up (WiFi/aircraft-count/nearest-callsign screen; full UI is a Roadmap item)
+- **Board**: ESP32-S3-WROOM-1-N16R8 (16MB flash, 8MB PSRAM), Waveshare ESP32-S3-Touch-LCD-7B
+- **Display**: ST7701, direct RGB-parallel (16-bit data bus + HSYNC/VSYNC/DE/PCLK), 1024×600, no vendor init sequence needed
+- **Touch**: GT911 capacitive touch over I2C (hand-rolled driver, `src/GT911_touch.{h,cpp}`); reset and backlight run through an I2C GPIO-expander (`src/IOExtension.{h,cpp}`), not direct GPIOs
 
 ## Data Sources
 
@@ -70,10 +83,10 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 
 ```
 CYD28/
-├── platformio.ini          # [env:cyd] and [env:jc4832] build configuration
+├── platformio.ini          # [env:cyd], [env:jc4832], [env:lcd7b] build configuration
 ├── config.env.example      # Configuration template (copy to config.env)
 ├── boards/
-│   └── esp32-s3-n16r8v.json  # Custom board def for the JC4832W535's ESP32-S3 module
+│   └── esp32-s3-n16r8v.json  # Custom board def for the JC4832W535/LCD-7B's ESP32-S3 module
 ├── .gitignore
 ├── README.md
 └── src/
@@ -83,6 +96,9 @@ CYD28/
     ├── display_cyd.cpp        # CYD-only: TFT_eSPI rendering + XPT2046 touch
     ├── display_jc4832.cpp     # JC4832W535-only: Arduino_GFX rendering + I2C touch
     ├── AXS15231B_touch.{h,cpp}  # Vendored touch driver for the JC4832W535
+    ├── display_lcd7b.cpp      # ESP32-S3-Touch-LCD-7B-only: Arduino_GFX RGB-panel rendering + GT911 touch
+    ├── IOExtension.{h,cpp}     # I2C GPIO-expander driver for the LCD-7B (backlight, touch reset)
+    ├── GT911_touch.{h,cpp}     # Hand-rolled GT911 touch driver for the LCD-7B
     └── config.env            # Your private config (gitignored)
 ```
 
@@ -108,9 +124,20 @@ CYD28/
    ```
    pio run -e cyd -t upload      # CYD (ESP32-2432S028)
    pio run -e jc4832 -t upload   # JC4832W535 (ESP32-S3)
+   pio run -e lcd7b -t upload    # ESP32-S3-Touch-LCD-7B (ESP32-S3)
    ```
-   Both boards share `src/config.env` — no per-board config needed.
-6. Once connected, find the device IP in the serial monitor and open it in a browser to change settings live (CYD only, currently — the JC4832W535's web server runs too, but there's no on-screen UI yet to reflect the settings back).
+   All three boards share `src/config.env` — no per-board config needed.
+6. Once connected, find the device IP in the serial monitor and open it in a browser to change settings live (CYD and JC4832W535 reflect settings back on-screen; the LCD-7B's web server runs too, but there's no on-screen UI yet to reflect the settings back — see Roadmap).
+
+## Web Flashing
+
+Prebuilt firmware can be flashed directly from a browser (Chrome/Edge, desktop, WebSerial) at **[segfaultlabs.github.io/CYD28PlaneSpotter](https://segfaultlabs.github.io/CYD28PlaneSpotter/)** — no PlatformIO install needed. This flashes whatever WiFi credentials/home location were baked into `src/config.env` when the published binaries were last built; to flash your own credentials, use the PlatformIO CLI flow above instead.
+
+The published binaries (`docs/firmware/*.bin`) are merged, flash-ready images (bootloader + partition table + app, via `esptool.py merge_bin`) and are **not** rebuilt automatically — after any firmware change intended for the web installer, rebuild and recommit them manually:
+```
+pio run -e cyd && pio run -e jc4832 && pio run -e lcd7b
+# then esptool.py merge_bin for each (see git history for the exact invocation)
+```
 
 ## Usage
 
@@ -123,8 +150,9 @@ CYD28/
 Ideas noted for future work, not yet implemented:
 
 - **Arrivals/departures board per nearby airport** — a dedicated screen (one per airport, e.g. GMP and ICN for the primary dev setup) listing upcoming arrivals and departures at that specific airport, rather than the existing Top 5/Target Intel screens which are organized by distance from home location instead of by airport.
-- **Full UI port to the JC4832W535** — `display_jc4832.cpp` currently only proves the hardware pipeline works (display, touch, WiFi, shared data layer). Porting the CYD's 5-screen UI (radar PPI, toggleable blip labels, Target Intel, Top 5, Weather & System) to this board's different resolution and aspect ratio (480×320 vs. 320×240) is real, sizable follow-up work — every screen's layout needs re-deriving, not just recompiling.
 - **On-hardware touch calibration for the JC4832W535** — the current touch offsets are a placeholder spanning the full native panel range; `checkTouch()` logs raw coordinates to Serial specifically so real calibration data can be gathered and the offsets tuned.
+- **Full UI port to the ESP32-S3-Touch-LCD-7B** — `display_lcd7b.cpp` currently only proves the hardware pipeline works (RGB panel, GT911 touch, IO-expander, WiFi, shared data layer). Porting the full screen set to this board's 1024×600 canvas is real, sizable follow-up work, same shape as the JC4832W535's own full-UI-port pass.
+- **WiFi provisioning via on-screen QR code** — for initial setup, show a QR code on the display (likely pointing at a captive-portal/AP-mode config page, or a URL encoding the device's own web config once it's reachable) instead of requiring WiFi credentials to be hardcoded into `src/config.env` before the first flash. Not started — noted here as a future usability improvement, not implemented yet.
 
 ## Dependencies
 
@@ -132,10 +160,10 @@ Ideas noted for future work, not yet implemented:
 - [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI) — TFT display driver
 - [XPT2046_Touchscreen](https://github.com/PaulStoffregen/XPT2046_Touchscreen) — Touch controller
 
-**JC4832W535 (`env:jc4832`)**
+**JC4832W535 (`env:jc4832`) and ESP32-S3-Touch-LCD-7B (`env:lcd7b`)**
 - [Arduino_GFX](https://github.com/moononournation/Arduino_GFX) — pinned to `1.4.5`; newer releases require ESP32 Arduino core 3.x, which this project doesn't currently use (see Design Decisions)
 
-**Both**
+**All three**
 - [ArduinoJson](https://arduinojson.org/) — JSON parsing
 
 All managed automatically via PlatformIO `lib_deps`, per environment.
