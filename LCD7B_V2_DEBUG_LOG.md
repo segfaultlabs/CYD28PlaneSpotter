@@ -191,11 +191,51 @@ Espressif recommends 64B cache lines in bounce mode + IRAM-safe ISR for
 high-pclk stability, but both need a custom sdkconfig.
 **Status: kept at 20MHz.**
 
+### 16. Feature pass (not display-engine): airports, trace colors, 5th screen, /health
+- Physical airports plotted as MAGENTA diamonds + IATA codes from a built-in
+  ~80-airport coordinate table (East Asia + world hubs).
+- Traces classified by airport proximity (25km) + altitude (<12000ft) +
+  vertical rate (±250fpm): CYAN takeoff / ORANGE landing / YELLOW flyover,
+  with an on-screen key on both radar screens.
+- 5th screen: full-screen 1024x600 radar (no header/column), big zoom
+  buttons, weather/contacts corners. Radar rendering refactored into a
+  shared `drawRadarCommon()` driven by a runtime `RadarLayout`.
+- `GET /health`: uptime, reset reason, heap/PSRAM floors, RSSI, frame
+  timings, API stats — for remote slowdown/crash monitoring.
+**Status: kept, verified on hardware.**
+
+### 17. pclk 30MHz via 120MHz PSRAM (phase 3) — build solved, USB flash pending
+The 120MHz-PSRAM recipe via pioarduino's HybridCompile. Three attempts:
+1. `board_build.f_flash = 120000000L` → build passed `--flash-freq 120m` to
+   esptool for image headers — **rejected** (S3 ROM boots flash at ≤80MHz;
+   IDF maps FLASHFREQ_120M to an '80m' header string, 2nd-stage bootloader
+   switches to 120MHz at runtime).
+2. 120M via inline `custom_sdkconfig` entries → built, but verification
+   showed SPIRAM/FLASH silently back at 80M: platformio's INI parser
+   **strips `# CONFIG_X is not set` lines** from multi-line option values,
+   so choice-symbol overrides never reached the sdkconfig.
+3. **Working config**: `board_build.f_boot = 120000000L` (drives the
+   compile-time unified frequency → generator emits real 120M flags) +
+   `board_build.f_image = 80000000L` (keeps esptool headers at 80m) +
+   inline custom_sdkconfig for the rest (64KB/64B data cache, XIP-from-PSRAM,
+   LCD_RGB_ISR_IRAM_SAFE, OPTIMIZATION_PERF, temp-tuning mitigation).
+   Verified in generated `sdkconfig.lcd7b_v2`: `SPIRAM_SPEED_120M=y`,
+   `ESPTOOLPY_FLASHFREQ_120M=y` with `"80m"` header string, all recipe items.
+**Critical deploy note**: the factory image must be **USB-flashed** — OTA
+only writes the app partition, and the 120MHz config lives in the
+bootloader. Recovery images (20MHz app + factory) stashed at
+`/tmp/lcd7b_recovery/`; clean rollback = USB-flash the 20MHz factory image
+(OTA-ing the 20MHz app back would leave the 120MHz bootloader underneath).
+**Status: built, pending USB flash + hardware soak (drift watch, then
+/health crash watch — 120MHz octal PSRAM is experimental, temperature-
+sensitive, and untested on this board's R8V chip variant).**
+
 ---
 
 ## Current state (as of this push)
 
-- `pclk_hz = 20000000` (stepped 10→16→20 ok, 22 unstable; ~21.8Hz physical refresh)
+- `pclk_hz = 30000000` **in source (phase 3, NOT yet flashed)** — last
+  hardware-verified build is 20MHz (~21.8Hz physical refresh)
 - `bounce_buffer_size_px = LCD_W * 20` (unchanged, known-good)
 - `num_fbs = 2`, real double buffering
 - **Zero-copy rendering**: canvas draws directly into the driver fb being
@@ -206,22 +246,24 @@ high-pclk stability, but both need a custom sdkconfig.
   buffer flips (#14)
 - Sweep fast tick: erase+redraw line per-buffer (positions tracked per fb),
   presents every frame — runs at the panel's physical refresh rate
-- Traces: connected YELLOW polyline, PSRAM-backed, up to 1800 samples
-  (~15-30 min), only cleared on true staleness
+- Radar screens: classic + full-screen (5th screen), shared drawRadarCommon;
+  airports plotted (MAGENTA diamonds), traces classified CYAN takeoff /
+  ORANGE landing / YELLOW flyover with on-screen key
+- Traces: PSRAM-backed, up to 1800 samples (~15-30 min), only cleared on
+  true staleness
 - Brightness: inverted correctly for the active-low PWM register
+- `GET /health` remote-monitoring endpoint
 
 ## Known open / unverified
 
-- Sweep smoothness is now capped by the ~21.8Hz physical refresh at 20MHz
-  pclk. Going higher needs the **120MHz-PSRAM recipe** (Waveshare's own heavy
-  LVGL demo for this exact board ships it): `custom_sdkconfig` in
-  platformio.ini (pioarduino supports it — triggers a full IDF-libs rebuild)
-  with `IDF_EXPERIMENTAL_FEATURES`, `SPIRAM_SPEED_120M`, flash QIO 120MHz,
-  `ESP32S3_DATA_CACHE_LINE_64B`, `SPIRAM_XIP_FROM_PSRAM`,
-  `LCD_RGB_ISR_IRAM_SAFE`, `COMPILER_OPTIMIZATION_PERF`, then pclk 30MHz
-  (~33Hz). Caveats: 120MHz octal PSRAM is officially *experimental*
-  (documented temperature-drift crash risk); this board's chip is the R8V
-  variant, which Espressif has not explicitly confirmed for 120MHz (the
-  N16R16V module is explicitly excluded, R8V untested). Not attempted.
-- Traces (length + color fix) and brightness (inversion fix) verified on
-  hardware as of the zero-copy session.
+- **Phase 3 (30MHz pclk) is built but not yet flashed**: needs a USB flash
+  of `firmware.factory.bin` (bootloader carries the 120MHz flash/PSRAM
+  config; OTA can't update it). See attempt #17 for the exact working
+  pioarduino config (`board_build.f_boot=120M` + `f_image=80m` +
+  custom_sdkconfig) and the pitfalls in attempts #1/#2. After flashing:
+  watch for drift first, then soak via /health — 120MHz octal PSRAM is
+  experimental (temperature-drift crash risk; mitigated via
+  SPIRAM_TIMING_TUNING_POINT_VIA_TEMPERATURE_SENSOR) and untested on this
+  board's R8V variant. Recovery: USB-flash the 20MHz factory image from
+  `/tmp/lcd7b_recovery/` (do NOT just OTA the 20MHz app back — that leaves
+  the 120MHz bootloader underneath).

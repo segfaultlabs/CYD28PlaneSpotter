@@ -263,10 +263,12 @@ void initRGBPanel() {
   // Steps verified on hardware, watching for the horizontal-drift symptom
   // (bounce-buffer underrun) at each: 10MHz ok (zero-copy build) ->
   // 16MHz ok -> 20MHz ok -> 22MHz UNSTABLE (drift — right at Espressif's
-  // ~22MHz tested ceiling for octal PSRAM @80MHz, no margin). Settled at
-  // 20MHz (~21.8Hz physical refresh). Going beyond needs the 120MHz-PSRAM
-  // custom-sdkconfig rebuild — see LCD7B_V2_DEBUG_LOG.md.
-  cfg.timings.pclk_hz = 20000000;
+  // ~22MHz tested ceiling for octal PSRAM @80MHz, no margin).
+  // 30MHz: enabled by the phase-3 build config (120MHz octal PSRAM + 120MHz
+  // flash via board_build.f_flash + custom_sdkconfig — see platformio.ini,
+  // and Espressif's tested "~30MHz with octal PSRAM @120MHz"). Needs
+  // USB-flashing (bootloader change), soak-tested via /health.
+  cfg.timings.pclk_hz = 30000000;
   cfg.timings.h_res = LCD_W;
   cfg.timings.v_res = LCD_H;
   cfg.timings.hsync_pulse_width = 162;

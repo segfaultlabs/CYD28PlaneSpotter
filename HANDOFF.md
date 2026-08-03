@@ -148,18 +148,24 @@ states on every buffer flip.
   `pushFrame()` waits on it after every present before the other buffer is
   drawn into again.
 
-**Known-bad, do not repeat**: `pclk_hz` above 20MHz with the current
-prebuilt core. Espressif's ESP-FAQ (LCD section) publishes tested ceilings:
-**~22MHz max with octal PSRAM @80MHz** (this project's prebuilt-core
-config), ~30MHz only with octal PSRAM @120MHz + flash @120MHz. Hardware
-results matched exactly: 22MHz drifted, 20MHz is the last confirmed-stable
-value under this app's real workload. Going past it needs pioarduino's
-`custom_sdkconfig` (full IDF-libs rebuild) with the recipe Waveshare's own
-heavy LVGL demo ships — `IDF_EXPERIMENTAL_FEATURES`, `SPIRAM_SPEED_120M`,
-flash 120MHz, `ESP32S3_DATA_CACHE_LINE_64B`, `SPIRAM_XIP_FROM_PSRAM`,
-`LCD_RGB_ISR_IRAM_SAFE`, `COMPILER_OPTIMIZATION_PERF`. Caveats: 120MHz octal
-PSRAM is officially experimental (temperature-drift crash risk) and this
-board's R8V chip variant is not explicitly confirmed for it. Not attempted.
+**Known-bad, do not repeat**: `pclk_hz` above 20MHz with the prebuilt core
+(PSRAM @80MHz). Espressif's ESP-FAQ (LCD section) publishes tested ceilings:
+**~22MHz max with octal PSRAM @80MHz**, ~30MHz only with octal PSRAM @120MHz
++ flash @120MHz. Hardware results matched exactly: 22MHz drifted, 20MHz is
+the last confirmed-stable value under that config.
+
+**Phase 3 (30MHz, ~33Hz) — BUILT, pending USB flash**: the 120MHz
+PSRAM+flash recipe is implemented via pioarduino HybridCompile
+(`board_build.f_boot=120M` + `board_build.f_image=80m` + `custom_sdkconfig`
+in `[env:lcd7b_v2]` — see LCD7B_V2_DEBUG_LOG.md attempt #17 for the three
+attempts it took and why) and `pclk_hz = 30000000` is set in source. The
+factory image must be **USB-flashed** (the 120MHz config lives in the
+bootloader; OTA can't touch it). After flashing: watch for drift, then soak
+via `/health`. 120MHz octal PSRAM is officially experimental
+(temperature-drift crash risk, mitigated in config) and this board's R8V
+chip variant is unverified for it. Recovery: USB-flash
+`/tmp/lcd7b_recovery/firmware_20mhz_factory.bin` (never OTA the 20MHz app
+back onto the 120MHz bootloader).
 
 **Not yet verified on hardware**: nothing outstanding — the zero-copy
 rework, trace-persistence change, brightness-inversion fix, and the
