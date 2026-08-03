@@ -33,6 +33,7 @@ void setup() {
   homeLon = prefs.getDouble("lon", homeLon);
   radarMaxKm = prefs.getFloat("range", radarMaxKm);
   invertColors = prefs.getBool("invert", invertColors);
+  brightness = prefs.getUChar("bright", brightness);
   showCallsign = prefs.getBool("callsign", showCallsign);
   showAirline = prefs.getBool("airline", showAirline);
   showSpeed = prefs.getBool("speed", showSpeed);
@@ -45,8 +46,9 @@ void setup() {
   showTraces = prefs.getBool("traces", showTraces);
   preferLocalTables = prefs.getBool("tables", preferLocalTables);
   applyInvertColors(invertColors);
-  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
-                homeLat, homeLon, radarMaxKm, invertColors, showCallsign, showAirline, showSpeed, showFL,
+  applyBrightness(brightness);
+  Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d bright=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
+                homeLat, homeLon, radarMaxKm, invertColors, brightness, showCallsign, showAirline, showSpeed, showFL,
                 showRoute, showReg, showSquawk, showVRate, showType, showTraces, preferLocalTables);
 
   // Create mutexes before the task (task uses them)

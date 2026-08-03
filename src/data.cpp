@@ -20,6 +20,7 @@ double homeLat = DEFAULT_HOME_LAT;
 double homeLon = DEFAULT_HOME_LON;
 float  radarMaxKm = DEFAULT_RADAR_MAX_KM;
 bool   invertColors = false;
+uint8_t brightness = 80;
 bool   showCallsign = false;
 bool   showSpeed = false;
 bool   showFL = false;
@@ -593,10 +594,10 @@ void initWebServer() {
   // GET / — serve config page
   server.on("/", []() {
     // Snapshot current values
-    double hLat, hLon; float rMax; bool inv;
+    double hLat, hLon; float rMax; bool inv; uint8_t bright;
     bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy, showTr, preferTables;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-    hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors;
+    hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors; bright = brightness;
     showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
     showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType; showTr = showTraces; preferTables = preferLocalTables;
     if (configMutex) xSemaphoreGive(configMutex);
@@ -625,6 +626,7 @@ void initWebServer() {
   input:checked + .slider{background:#00ff88}
   input:checked + .slider:before{transform:translateX(22px)}
   .section-hd{color:#888;font-size:0.75em;text-transform:uppercase;letter-spacing:0.05em;margin:18px 0 4px;border-top:1px solid #333;padding-top:14px}
+  input[type=range]{width:100%;padding:0;accent-color:#00ff88}
 </style></head><body>
 <h1>&#9992; CYD Plane Spotter</h1>
 <div class="card">
@@ -642,6 +644,8 @@ void initWebServer() {
         <span class="slider"></span>
       </label>
     </div>
+    <label for="bright">Brightness &mdash; <span id="brightVal">)rawliteral" + String(bright) + R"rawliteral(</span>%</label>
+    <input type="range" name="bright" id="bright" min="1" max="100" value=")rawliteral" + String(bright) + R"rawliteral(" oninput="document.getElementById('brightVal').textContent=this.value">
     <div class="section-hd">Radar Label Fields</div>
     <div class="switch-row">
       <label for="callsign">Flight Number</label>
@@ -747,6 +751,7 @@ function save(e){
          '&lon='+encodeURIComponent(document.getElementById('lon').value)+
          '&range='+encodeURIComponent(document.getElementById('range').value)+
          '&dark='+(document.getElementById('dark').checked?'1':'0')+
+         '&bright='+encodeURIComponent(document.getElementById('bright').value)+
          '&callsign='+(document.getElementById('callsign').checked?'1':'0')+
          '&airline='+(document.getElementById('airline').checked?'1':'0')+
          '&speed='+(document.getElementById('speed').checked?'1':'0')+
@@ -794,6 +799,7 @@ function doOta(e){
     double newLon = server.arg("lon").toDouble();
     float  newRng = server.arg("range").toFloat();
     bool   newInvert = server.hasArg("dark") ? (server.arg("dark") != "1") : invertColors;
+    uint8_t newBrightness = server.hasArg("bright") ? (uint8_t)server.arg("bright").toInt() : brightness;
     bool   newShowCallsign = server.hasArg("callsign") ? (server.arg("callsign") == "1") : showCallsign;
     bool   newShowAirline = server.hasArg("airline") ? (server.arg("airline") == "1") : showAirline;
     bool   newShowSpeed = server.hasArg("speed") ? (server.arg("speed") == "1") : showSpeed;
@@ -812,6 +818,8 @@ function doOta(e){
       server.send(400, "text/plain", "Invalid values");
       return;
     }
+    if (newBrightness < 1) newBrightness = 1;
+    if (newBrightness > 100) newBrightness = 100;
 
     // Atomically update
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
@@ -819,6 +827,7 @@ function doOta(e){
     homeLon = newLon;
     radarMaxKm = newRng;
     invertColors = newInvert;
+    brightness = newBrightness;
     showCallsign = newShowCallsign;
     showAirline = newShowAirline;
     showSpeed = newShowSpeed;
@@ -832,12 +841,14 @@ function doOta(e){
     preferLocalTables = newPreferTables;
     if (configMutex) xSemaphoreGive(configMutex);
     applyInvertColors(newInvert);
+    applyBrightness(newBrightness);
 
     // Persist to NVS
     prefs.putDouble("lat", newLat);
     prefs.putDouble("lon", newLon);
     prefs.putFloat("range", newRng);
     prefs.putBool("invert", newInvert);
+    prefs.putUChar("bright", newBrightness);
     prefs.putBool("callsign", newShowCallsign);
     prefs.putBool("airline", newShowAirline);
     prefs.putBool("speed", newShowSpeed);

@@ -33,10 +33,27 @@
  */
 
 #include "shared.h"
+#include <WiFi.h>
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
 #include "IOExtension.h"
 #include "GT911_touch.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_rgb.h"
+#include "esp_lcd_panel_vendor.h"
+
+// Arduino_GFX 1.6.7 removed the short color aliases (BLACK, WHITE, ...) that
+// existed in 1.4.5 (used by display_jc4832.cpp / display_lcd7b.cpp), keeping
+// only the RGB565_-prefixed names. Aliasing locally rather than rewriting
+// every color reference throughout this file.
+#define BLACK RGB565_BLACK
+#define WHITE RGB565_WHITE
+#define RED RGB565_RED
+#define GREEN RGB565_GREEN
+#define CYAN RGB565_CYAN
+#define YELLOW RGB565_YELLOW
+#define DARKGREY RGB565_DARKGREY
+#define LIGHTGREY RGB565_LIGHTGREY
 
 // I2C bus shared by the IO-expander and GT911 touch
 #define I2C_SDA 8
@@ -71,55 +88,10 @@
 #define LCD_W 1024
 #define LCD_H 600
 
-Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
-    PIN_DE, PIN_VSYNC, PIN_HSYNC, PIN_PCLK,
-    PIN_R0, PIN_R1, PIN_R2, PIN_R3, PIN_R4,
-    PIN_G0, PIN_G1, PIN_G2, PIN_G3, PIN_G4, PIN_G5,
-    PIN_B0, PIN_B1, PIN_B2, PIN_B3, PIN_B4,
-    // hsync/vsync_polarity=0: Arduino_ESP32RGBPanel::getFrameBuffer() writes
-    // hsync_polarity/vsync_polarity directly into the raw LCD_CAM.lcd_ctrl2
-    // idle-pol registers *after* esp_lcd_new_rgb_panel()/panel_init() already
-    // ran — it overrides whatever the hsync_idle_low/vsync_idle_low struct
-    // flags produced, so those flags (and matching the vendor's ESP-IDF
-    // struct defaults) are irrelevant here. 0/0 matches two independent
-    // working Arduino_GFX/LovyanGFX configs for this exact pin-compatible
-    // Waveshare board family (different panel sizes, same GPIO layout).
-    0 /* hsync_polarity */, 48 /* hsync_front_porch */, 162 /* hsync_pulse_width */, 152 /* hsync_back_porch */,
-    0 /* vsync_polarity */, 3 /* vsync_front_porch */, 45 /* vsync_pulse_width */, 13 /* vsync_back_porch */,
-    // 30MHz (the vendor's ESP-IDF value) exceeds the sustainable pixel clock
-    // for Octal PSRAM @ 80MHz on a bounce-buffer-less RGB panel setup (~22MHz
-    // ceiling) — Arduino_ESP32RGBPanel doesn't configure a bounce buffer the
-    // way the vendor's own esp_lcd example does, so the framebuffer is read
-    // from PSRAM directly by DMA at the full pixel rate. That mismatch reads
-    // as a rolling/scrambled image, not a clean failure. 16MHz matches the
-    // confirmed-working config for a pin-compatible sibling Waveshare board;
-    // the library's own internal default for non-Quad-PSRAM boards is 12MHz.
-    1 /* pclk_active_neg */, 16000000 /* pclk_hz */, false /* useBigEndian */);
-
-// Bare mode: no companion bus, no reset pin, no vendor init sequence — the
-// panel self-configures into RGB passthrough (see file header).
-//
-// auto_flush=false, not true: there is only ONE framebuffer here (this
-// class draws straight into the RGB panel's own live, DMA-scanned PSRAM
-// buffer — confirmed by reading Arduino_RGB_Display.cpp, no shadow/back
-// buffer exists). With auto_flush=true, every individual draw call
-// immediately does a cache write-back, making each intermediate step of a
-// multi-call redraw (clear, then rings, then blips) visible to the DMA
-// scan-out as it happens — that's the flicker. DMA reads PSRAM directly
-// (bypassing CPU D-cache), so as long as we DON'T force a write-back,
-// DMA keeps showing the old, complete frame while we draw the new one in
-// cache; a single explicit flush() at the end of a render pass (already
-// called once per cycle in render()) then makes the whole new frame appear
-// at once instead of incrementally.
-Arduino_GFX *gfx = new Arduino_RGB_Display(LCD_W, LCD_H, rgbpanel, 0, false);
-
-IOExtension ioExpander;
-GT911_Touch touch(TOUCH_INT, ioExpander);
-
-#define LCD7B_NUM_SCREENS 4  // Target Intel, Top 5, Radar, Weather & System
-
 // Layout (1024x600): header 0-35px; left info column x:0-260; radar area
-// x:260-1024 x y:35-600, circle centered in that region.
+// x:260-1024 x y:35-600, circle centered in that region. Declared up here
+// (not down with the rest of the layout section) since the sweep/present
+// machinery below is declared before the layout section proper.
 static const int HEADER_H = 35;
 static const int RADAR_AREA_X = 260, RADAR_AREA_Y = HEADER_H;
 static const int RADAR_AREA_W = LCD_W - RADAR_AREA_X, RADAR_AREA_H = LCD_H - HEADER_H;
@@ -127,19 +99,210 @@ static const int RADAR_CX = RADAR_AREA_X + RADAR_AREA_W / 2;
 static const int RADAR_CY = RADAR_AREA_Y + RADAR_AREA_H / 2;
 static const int RADAR_R = 260;
 
+// Real double-buffered RGB panel, bypassing Arduino_GFX's RGB bus classes
+// entirely — confirmed by reading Arduino_ESP32RGBPanel's source directly
+// (both the 1.4.5 this project pins for the other boards, and the current
+// 1.6.7) that it has never implemented true double buffering, at any
+// version: "It uses a Single Frame Buffer in PSRAM" per the class's own
+// header comment. bounce_buffer_size_px exists but only helps PSRAM
+// bandwidth contention (already solved via pclk=16MHz on [env:lcd7b]) — not
+// draw-tearing. True double buffering needs num_fbs=2 at the ESP-IDF layer,
+// which doesn't exist in the older ESP-IDF this project's other boards'
+// core (2.0.14) bundles — hence this being a separate core-3.x environment.
+//
+// Pin/timing values below are unchanged from [env:lcd7b]'s already-verified
+// config (same pins, same porches, same pclk=16MHz, same polarity=0/0) —
+// only the buffering strategy differs.
+static esp_lcd_panel_handle_t panelHandle = NULL;
+
+// The driver's two framebuffers (num_fbs=2, allocated by esp_lcd itself in
+// PSRAM, fetched in initRGBPanel()) and which one the canvas currently
+// targets. Declared up here because initRGBPanel() populates them.
+static uint16_t *panelFbs[2] = {nullptr, nullptr};
+static uint8_t drawBufIdx = 0;
+
+// Fires once the hardware has genuinely finished consuming the frame buffer
+// content we last handed it via draw_bitmap -- confirmed via Waveshare's own
+// LVGL reference for this exact panel (rgb_lcd_port.cpp/lvgl_port.cpp):
+// their flush callback calls draw_bitmap, then blocks on this exact
+// notification (on_bounce_frame_finish, aliased to on_frame_buf_complete)
+// before letting LVGL render the next frame. Our own pushFrame()/
+// pushPartial() were firing draw_bitmap with no wait at all (just a 1-tick
+// vTaskDelay) -- nothing stopped us writing into a buffer the DMA scanner
+// was still mid-read on, which is the actual cause of the ghosting/tearing
+// that survived every earlier fix (full-vs-partial push, refresh_on_demand,
+// the stale-sweep-position bug). This callback runs continuously at the
+// panel's own refresh rate regardless of whether we drew anything, so
+// waitFrameDone() below drains any stale pending signal first (mirroring
+// Waveshare's own ulTaskNotifyValueClear() immediately before their wait) --
+// otherwise we could consume a leftover signal from before our draw call
+// and return without actually having waited for it.
+static SemaphoreHandle_t frameDoneSem = nullptr;
+IRAM_ATTR static bool onFrameBufComplete(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
+  BaseType_t hpw = pdFALSE;
+  xSemaphoreGiveFromISR(frameDoneSem, &hpw);
+  return hpw == pdTRUE;
+}
+static void waitFrameDone() {
+  while (xSemaphoreTake(frameDoneSem, 0) == pdTRUE) {}  // drain stale signal
+  xSemaphoreTake(frameDoneSem, pdMS_TO_TICKS(200));
+}
+
+void initRGBPanel() {
+  esp_lcd_rgb_panel_config_t cfg = {};
+  cfg.clk_src = LCD_CLK_SRC_DEFAULT;
+  // pclk stepped in ISOLATION (only change in the build) per the debug-log
+  // rule. Physical refresh = pclk / ~(1386x661 total px) — this is the hard
+  // ceiling on sweep smoothness. Espressif's tested ceilings (ESP-FAQ, LCD
+  // section): ~22MHz max with octal PSRAM @80MHz (our config); 30MHz needs
+  // PSRAM @120MHz + flash @120MHz (custom sdkconfig rebuild — not done).
+  // Steps verified on hardware, watching for the horizontal-drift symptom
+  // (bounce-buffer underrun) at each: 10MHz ok (zero-copy build) ->
+  // 16MHz ok -> 20MHz ok -> 22MHz UNSTABLE (drift — right at Espressif's
+  // ~22MHz tested ceiling for octal PSRAM @80MHz, no margin). Settled at
+  // 20MHz (~21.8Hz physical refresh). Going beyond needs the 120MHz-PSRAM
+  // custom-sdkconfig rebuild — see LCD7B_V2_DEBUG_LOG.md.
+  cfg.timings.pclk_hz = 20000000;
+  cfg.timings.h_res = LCD_W;
+  cfg.timings.v_res = LCD_H;
+  cfg.timings.hsync_pulse_width = 162;
+  cfg.timings.hsync_back_porch = 152;
+  cfg.timings.hsync_front_porch = 48;
+  cfg.timings.vsync_pulse_width = 45;
+  cfg.timings.vsync_back_porch = 13;
+  cfg.timings.vsync_front_porch = 3;
+  cfg.timings.flags.pclk_active_neg = 1;
+  cfg.data_width = 16;
+  cfg.bits_per_pixel = 16;
+  cfg.num_fbs = 2;  // the actual fix — two hardware-managed buffers instead of one
+  // dma_burst_size replaces the old sram_trans_align/psram_trans_align pair
+  // (deprecated, now a union with this). 64 matches what Arduino_ESP32RGBPanel
+  // explicitly set for psram_trans_align in the old single-buffer path.
+  cfg.dma_burst_size = 64;
+  // Bounce buffer: this is the real fix for the "screen drift"/horizontal-
+  // shift symptom actually hit on hardware. Root cause per Espressif's own
+  // RGB-panel troubleshooting notes: GDMA can hit a FIFO under-run reading
+  // frame data straight from PSRAM, after which the LCD controller keeps
+  // pulling pixels from the wrong address — a line-by-line shift. Their
+  // documented fix is enabling the bounce buffer (fast internal-SRAM staging
+  // buffers DMA reads from instead of PSRAM directly), sized >= 20 lines to
+  // keep enough VBlank margin for the ISR refill. This is also why this had
+  // to be a core-3.x environment in the first place, separate from that
+  // research: this fix needs ESP-IDF >= 5.1, which arduino-esp32 2.x (this
+  // project's other boards) bundles an older ESP-IDF that predates.
+  cfg.bounce_buffer_size_px = LCD_W * 20;
+  cfg.hsync_gpio_num = PIN_HSYNC;
+  cfg.vsync_gpio_num = PIN_VSYNC;
+  cfg.de_gpio_num = PIN_DE;
+  cfg.pclk_gpio_num = PIN_PCLK;
+  cfg.disp_gpio_num = -1;
+  // Same non-bigEndian data line order Arduino_ESP32RGBPanel used: B0-4,
+  // G0-5, R0-4 (indices 0-15), matching this board's official pin mapping.
+  cfg.data_gpio_nums[0] = PIN_B0; cfg.data_gpio_nums[1] = PIN_B1; cfg.data_gpio_nums[2] = PIN_B2;
+  cfg.data_gpio_nums[3] = PIN_B3; cfg.data_gpio_nums[4] = PIN_B4;
+  cfg.data_gpio_nums[5] = PIN_G0; cfg.data_gpio_nums[6] = PIN_G1; cfg.data_gpio_nums[7] = PIN_G2;
+  cfg.data_gpio_nums[8] = PIN_G3; cfg.data_gpio_nums[9] = PIN_G4; cfg.data_gpio_nums[10] = PIN_G5;
+  cfg.data_gpio_nums[11] = PIN_R0; cfg.data_gpio_nums[12] = PIN_R1; cfg.data_gpio_nums[13] = PIN_R2;
+  cfg.data_gpio_nums[14] = PIN_R3; cfg.data_gpio_nums[15] = PIN_R4;
+  cfg.flags.fb_in_psram = 1;
+  // Tried refresh_on_demand=1 here to fix a "two lines, one paused one
+  // moving" ghosting artifact (theory: continuous-stream mode's autonomous
+  // background re-scan racing our buffer flips). Result was a fully black
+  // screen instead -- this "dumb" RGB panel has no onboard memory of its
+  // own (unlike the JC4832W535's QSPI panel), so it needs a genuinely
+  // continuous signal just to show anything at all; refresh_on_demand
+  // apparently stops that signal between our (infrequent, ~30-150ms
+  // spaced) triggers rather than just gating when new content transmits.
+  // Reverted -- default continuous-stream mode, ghosting not yet solved.
+
+  ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&cfg, &panelHandle));
+  ESP_ERROR_CHECK(esp_lcd_panel_reset(panelHandle));
+  ESP_ERROR_CHECK(esp_lcd_panel_init(panelHandle));
+
+  frameDoneSem = xSemaphoreCreateBinary();
+  esp_lcd_rgb_panel_event_callbacks_t cbs = {};
+  cbs.on_frame_buf_complete = onFrameBufComplete;
+  ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panelHandle, &cbs, NULL));
+
+  // Fetch the driver's own two framebuffers so the canvas can draw directly
+  // into them (zero-copy present — see DirectCanvas/pushFrame above).
+  void *fb0 = nullptr, *fb1 = nullptr;
+  ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panelHandle, 2, &fb0, &fb1));
+  panelFbs[0] = (uint16_t *)fb0;
+  panelFbs[1] = (uint16_t *)fb1;
+}
+
+// Zero-copy rendering surface. Arduino_Canvas allocates its own framebuffer
+// in begin() only if _framebuffer is still null, so this subclass injects a
+// pointer BEFORE begin() — and then the canvas rasterizes straight into one
+// of the panel driver's own two framebuffers, with no buffer of its own.
+// (The destructor would free() the injected pointer, but this object lives
+// forever, so it never runs.)
+class DirectCanvas : public Arduino_Canvas {
+public:
+  DirectCanvas(int16_t w, int16_t h) : Arduino_Canvas(w, h, nullptr) {}
+  void setBuffer(uint16_t *buf) { _framebuffer = buf; }
+};
+DirectCanvas *gfx = new DirectCanvas(LCD_W, LCD_H);
+
+// Presents the just-drawn frame: hands the driver the pointer of the buffer
+// the canvas drew into. Verified against esp_lcd_panel_rgb.c @ v5.5.5 (the
+// exact IDF this build bundles): when the color_data pointer falls inside
+// one of the driver's own framebuffers, draw_bitmap() does NO copy at all —
+// it just sets cur_fb_index to that buffer (adopted by the bounce engine at
+// the next frame wrap) and cache-syncs. The previous design instead kept a
+// separate 1.2MB canvas and CPU-copied the whole thing into the driver fb on
+// every frame — doubling the cost of every frame and putting a 1.2MB
+// PSRAM->PSRAM memcpy on the exact same bus the DMA scan-out reads from,
+// which is precisely the contention that forces pclk (and therefore the
+// panel's physical refresh rate) down. waitFrameDone() then blocks until the
+// hardware has fully streamed the OTHER buffer, making it safe to draw into
+// next — drawing into a buffer mid-scan is what tearing looks like.
+void pushFrame() {
+  esp_lcd_panel_draw_bitmap(panelHandle, 0, 0, LCD_W, LCD_H, panelFbs[drawBufIdx]);
+  waitFrameDone();
+  drawBufIdx ^= 1;
+  gfx->setBuffer(panelFbs[drawBufIdx]);
+}
+
+IOExtension ioExpander;
+GT911_Touch touch(TOUCH_INT, ioExpander);
+
+#define LCD7B_NUM_SCREENS 4  // Target Intel, Top 5, Radar, Weather & System
+
+// Per-frame timing breakdown, updated every render() call, read via
+// GET /timingdebug -- so we can see exactly where a frame's time goes
+// (canvas clear vs. screen draw vs. driver push) instead of guessing.
+static volatile uint32_t lastFillUs = 0, lastDrawUs = 0, lastPushUs = 0, lastFrameIntervalMs = 0;
+
 // Flight-path trace history (Radar screen, showTraces toggle). Keyed by
 // callsign rather than blips[] array index, since that index isn't stable
 // between fetch cycles — a trail must follow one aircraft, not one array
 // slot. Lives here (not shared.h/data.cpp) since it's purely a rendering
 // concern local to this board's Radar screen.
-#define TRAIL_LEN 6
+// 1800 samples ~= 15-30 min of history at this screen's 1-2Hz full-redraw
+// sampling rate -- long enough that no realistic single viewing session
+// should ever see a trail age out by hitting this cap; only true staleness
+// (TRAIL_STALE_MS, aircraft actually gone) should ever clear a trail. Backed
+// by PSRAM (ps_malloc, lazily allocated per slot and kept for the life of
+// the program) rather than a fixed struct member -- 1800*16 bytes*20 slots
+// is ~560KB, too big to want living in internal SRAM/.bss alongside
+// everything else, but trivial against this board's 8MB PSRAM.
+#define TRAIL_LEN 1800
 #define TRAIL_SLOTS MAX_BLIPS
 #define TRAIL_STALE_MS 15000  // drop a trail if its aircraft hasn't been seen in this long
 struct TrailHistory {
   char callsign[10] = {0};
-  double lat[TRAIL_LEN] = {0}, lon[TRAIL_LEN] = {0};
-  uint8_t count = 0;
+  double *lat = nullptr, *lon = nullptr;  // ps_malloc'd on first use, kept across resets
+  uint16_t count = 0;  // TRAIL_LEN > 255, so this can't be uint8_t
   uint32_t lastSeenMs = 0;
+  // Clears the trail's identity/content but keeps its PSRAM buffer
+  // allocated for reuse -- a plain `t = TrailHistory()` would instead null
+  // out lat/lon and leak the previous allocation.
+  void reset() { callsign[0] = 0; count = 0; lastSeenMs = 0; }
+  void ensureBuf() {
+    if (!lat) { lat = (double *)ps_malloc(sizeof(double) * TRAIL_LEN); lon = (double *)ps_malloc(sizeof(double) * TRAIL_LEN); }
+  }
 };
 static TrailHistory trails[TRAIL_SLOTS];
 
@@ -410,6 +573,13 @@ void screenTop5() {
 static const int RNG_BTN_X = 30, RNG_BTN_W = 180, RNG_BTN_H = 70;
 static const int RNG_PLUS_Y = 380, RNG_MINUS_Y = 470;
 
+// The sweep-line endpoint screenRadar() ACTUALLY drew on its last full
+// redraw, recorded at draw time. renderRadar() seeds its per-buffer erase
+// position from this — recomputing the angle from a fresh millis() after the
+// (slow) draw would produce a position that was never on screen, which was
+// the original "one paused line, one moving line" ghosting bug.
+static int drawnSweepX = RADAR_CX, drawnSweepY = RADAR_CY - RADAR_R;
+
 void screenRadar() {
   drawHeader("RADAR");
 
@@ -471,110 +641,104 @@ void screenRadar() {
   gfx->print("-");
 
   // --- Radar circle ---
-  // Unlike the CYD/JC4832W535 (which redraw an offscreen sprite/canvas and
-  // blit it in one go via a real back buffer), this board's Arduino_GFX RGB
-  // panel support has no double-buffering at all on this project's pinned
-  // ESP32 Arduino core (2.0.14) — its bundled ESP-IDF predates the
-  // num_fbs/bounce_buffer fields the vendor's own reference code relies on
-  // for tear-free updates, and upgrading the core would break Arduino_GFX/
-  // AXS15231B compatibility for the other two boards. So every draw here
-  // lands directly on the live, continuously-scanned framebuffer, and any
-  // full-area clear+redraw is visible mid-draw.
-  //
-  // Given that constraint, the sweep line — which needs to move every
-  // frame for smooth motion — is erased and redrawn as a single thin line
-  // (tiny footprint) on every call. The much heavier full redraw (clear +
-  // rings + compass + blips + labels + trails) only happens every ~600ms,
-  // which cuts how often the large-area flicker is visible without
-  // sacrificing sweep smoothness.
+  // With a real double-buffered panel, this goes back to a plain full
+  // clear-and-redraw every cycle (render() already clears the whole canvas
+  // before calling this) — same as the JC4832W535. No more fast/slow
+  // cadence split or manual sweep-line erase-tracking; those existed only
+  // to minimize how much of a single, live-scanned buffer was visibly
+  // redrawn per frame, which no longer applies once nothing is visible
+  // until pushFrame() flips the buffer.
   const int cx = RADAR_CX, cy = RADAR_CY, R = RADAR_R;
+  uint32_t nowMs = millis();
   float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
   double sw = deg2rad(sweepDeg);
-  int sweepEndX = cx + (int)(sin(sw) * R), sweepEndY = cy - (int)(cos(sw) * R);
 
-  static uint32_t lastFullDraw = 0;
-  static int prevSweepX = cx, prevSweepY = cy - R;
-  static bool havePrevSweep = false;
-  uint32_t nowMs = millis();
-  bool doFull = (nowMs - lastFullDraw >= 600);
+  gfx->drawCircle(cx, cy, R, DARKGREY);
+  gfx->drawCircle(cx, cy, R * 2 / 3, DARKGREY);
+  gfx->drawCircle(cx, cy, R / 3, DARKGREY);
+  gfx->drawLine(cx - R, cy, cx + R, cy, DARKGREY);
+  gfx->drawLine(cx, cy - R, cx, cy + R, DARKGREY);
 
-  if (doFull) {
-    lastFullDraw = nowMs;
-    gfx->fillRect(RADAR_AREA_X, RADAR_AREA_Y, RADAR_AREA_W, RADAR_AREA_H, BLACK);
-    gfx->drawCircle(cx, cy, R, DARKGREY);
-    gfx->drawCircle(cx, cy, R * 2 / 3, DARKGREY);
-    gfx->drawCircle(cx, cy, R / 3, DARKGREY);
-    gfx->drawLine(cx - R, cy, cx + R, cy, DARKGREY);
-    gfx->drawLine(cx, cy - R, cx, cy + R, DARKGREY);
+  // Compass — matches the same north-up, clockwise convention already
+  // used for blip placement (bx = cx + sin(brg)*r, by = cy - cos(brg)*r,
+  // brg 0=N/90=E/180=S/270=W), so these letters are correct relative to
+  // where blips actually land, not just decorative.
+  gfx->setTextSize(2);
+  gfx->setTextColor(LIGHTGREY, BLACK);
+  int16_t lx1, ly1; uint16_t lw, lh;
+  gfx->getTextBounds("N", 0, 0, &lx1, &ly1, &lw, &lh);
+  gfx->setCursor(cx - lw / 2, cy - R - lh - 6); gfx->print("N");
+  gfx->setCursor(cx - lw / 2, cy + R + 6); gfx->print("S");
+  gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
+  gfx->setCursor(cx + R + 8, cy - lh / 2); gfx->print("E");
+  gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
+  gfx->setCursor(cx - R - 8 - lw, cy - lh / 2); gfx->print("W");
 
-    // Compass — matches the same north-up, clockwise convention already
-    // used for blip placement (bx = cx + sin(brg)*r, by = cy - cos(brg)*r,
-    // brg 0=N/90=E/180=S/270=W), so these letters are correct relative to
-    // where blips actually land, not just decorative.
-    gfx->setTextSize(2);
-    gfx->setTextColor(LIGHTGREY, BLACK);
-    int16_t lx1, ly1; uint16_t lw, lh;
-    gfx->getTextBounds("N", 0, 0, &lx1, &ly1, &lw, &lh);
-    gfx->setCursor(cx - lw / 2, cy - R - lh - 6); gfx->print("N");
-    gfx->setCursor(cx - lw / 2, cy + R + 6); gfx->print("S");
-    gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
-    gfx->setCursor(cx + R + 8, cy - lh / 2); gfx->print("E");
-    gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
-    gfx->setCursor(cx - R - 8 - lw, cy - lh / 2); gfx->print("W");
+  drawnSweepX = cx + (int)(sin(sw) * R);
+  drawnSweepY = cy - (int)(cos(sw) * R);
+  gfx->drawLine(cx, cy, drawnSweepX, drawnSweepY, GREEN);
 
-    float elapsed = (millis() - lastDataMs) / 1000.0f;
+  float elapsed = (millis() - lastDataMs) / 1000.0f;
 
-    // --- Flight path traces: per-aircraft position history, keyed by
-    // callsign since blips[] array indices aren't stable between fetch
-    // cycles. Sampled once per full-redraw (~600ms) rather than every
-    // frame -- dense enough to show a path, sparse enough to stay cheap.
-    // Entries not seen in TRAIL_STALE_MS are dropped, so a trail vanishes
-    // once its aircraft is no longer tracked (out of range / off screen).
-    if (showTraces) {
-      for (uint8_t i = 0; i < blipCount; i++) {
-        if (!blips[i].callsign[0]) continue;
-        int slot = -1, oldest = 0;
-        for (uint8_t s = 0; s < TRAIL_SLOTS; s++) {
-          if (trails[s].callsign[0] && strcmp(trails[s].callsign, blips[i].callsign) == 0) { slot = s; break; }
-          if (!trails[s].callsign[0] || trails[s].lastSeenMs < trails[oldest].lastSeenMs) oldest = s;
-        }
-        if (slot < 0) {
-          slot = oldest;
-          trails[slot] = TrailHistory();
-          strncpy(trails[slot].callsign, blips[i].callsign, 9); trails[slot].callsign[9] = '\0';
-        }
-        TrailHistory &t = trails[slot];
-        if (t.count < TRAIL_LEN) {
-          t.lat[t.count] = blips[i].lat; t.lon[t.count] = blips[i].lon; t.count++;
-        } else {
-          for (uint8_t j = 1; j < TRAIL_LEN; j++) { t.lat[j-1] = t.lat[j]; t.lon[j-1] = t.lon[j]; }
-          t.lat[TRAIL_LEN-1] = blips[i].lat; t.lon[TRAIL_LEN-1] = blips[i].lon;
-        }
-        t.lastSeenMs = nowMs;
-      }
+  // --- Flight path traces: per-aircraft position history, keyed by
+  // callsign since blips[] array indices aren't stable between fetch
+  // cycles. Sampled once per render cycle. Entries not seen in
+  // TRAIL_STALE_MS are dropped, so a trail vanishes once its aircraft is
+  // no longer tracked (out of range / off screen).
+  if (showTraces) {
+    for (uint8_t i = 0; i < blipCount; i++) {
+      if (!blips[i].callsign[0]) continue;
+      int slot = -1, oldest = 0;
       for (uint8_t s = 0; s < TRAIL_SLOTS; s++) {
-        TrailHistory &t = trails[s];
-        if (!t.callsign[0]) continue;
-        if (nowMs - t.lastSeenMs > TRAIL_STALE_MS) { t = TrailHistory(); continue; }
-        for (uint8_t j = 0; j < t.count; j++) {
+        if (trails[s].callsign[0] && strcmp(trails[s].callsign, blips[i].callsign) == 0) { slot = s; break; }
+        if (!trails[s].callsign[0] || trails[s].lastSeenMs < trails[oldest].lastSeenMs) oldest = s;
+      }
+      if (slot < 0) {
+        slot = oldest;
+        trails[slot].reset();
+        strncpy(trails[slot].callsign, blips[i].callsign, 9); trails[slot].callsign[9] = '\0';
+      }
+      TrailHistory &t = trails[slot];
+      t.ensureBuf();
+      if (t.count < TRAIL_LEN) {
+        t.lat[t.count] = blips[i].lat; t.lon[t.count] = blips[i].lon; t.count++;
+      } else {
+        for (uint16_t j = 1; j < TRAIL_LEN; j++) { t.lat[j-1] = t.lat[j]; t.lon[j-1] = t.lon[j]; }
+        t.lat[TRAIL_LEN-1] = blips[i].lat; t.lon[TRAIL_LEN-1] = blips[i].lon;
+      }
+      t.lastSeenMs = nowMs;
+    }
+    for (uint8_t s = 0; s < TRAIL_SLOTS; s++) {
+      TrailHistory &t = trails[s];
+      if (!t.callsign[0]) continue;
+      if (nowMs - t.lastSeenMs > TRAIL_STALE_MS) { t.reset(); continue; }
+        // Connected polyline, not separate dots -- a trail of isolated 2-3px
+        // dots is nearly indistinguishable from noise at this scale (typical
+        // sample-to-sample movement is only a few px), and doesn't read as
+        // "a path" the way a real radar trace does. YELLOW, not DARKGREY:
+        // the three range rings are DARKGREY, so anything drawn in that same
+        // color blends straight into them.
+        int prevPx = 0, prevPy = 0; bool havePrev = false;
+        for (uint16_t j = 0; j < t.count; j++) {
           double dist = haversineKm(hLat, hLon, t.lat[j], t.lon[j]);
           float fr = (float)(dist / rMax);
-          if (fr > 1) continue;
+          if (fr > 1) { havePrev = false; continue; }
           int rr = (int)(fr * R);
           double brg = bearingDeg(hLat, hLon, t.lat[j], t.lon[j]);
           int px = cx + (int)(sin(deg2rad(brg)) * rr);
           int py = cy - (int)(cos(deg2rad(brg)) * rr);
-          gfx->fillCircle(px, py, 2, DARKGREY);
+          if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, YELLOW);
+          prevPx = px; prevPy = py; havePrev = true;
         }
-      }
     }
+  }
 
-    gfx->setTextSize(2);
+  gfx->setTextSize(2);
 
-    LabelRect placed[MAX_BLIPS];
-    int placedCount = 0;
+  LabelRect placed[MAX_BLIPS];
+  int placedCount = 0;
 
-    for (uint8_t i = 0; i < blipCount; i++) {
+  for (uint8_t i = 0; i < blipCount; i++) {
       double la = blips[i].lat, lo = blips[i].lon;
       if (blips[i].speedMs > 0 && elapsed > 0)
         projectLatLon(blips[i].lat, blips[i].lon, blips[i].track, blips[i].speedMs * elapsed, la, lo);
@@ -637,16 +801,8 @@ void screenRadar() {
                    RADAR_AREA_X, RADAR_AREA_Y, RADAR_AREA_W, RADAR_AREA_H);
       }
     }
-
-    havePrevSweep = false;  // rings/blips just got redrawn fresh; no stale sweep line to erase
-  } else if (havePrevSweep) {
-    gfx->drawLine(cx, cy, prevSweepX, prevSweepY, BLACK);
-  }
-
-  gfx->drawLine(cx, cy, sweepEndX, sweepEndY, GREEN);
-  prevSweepX = sweepEndX; prevSweepY = sweepEndY;
-  havePrevSweep = true;
 }
+
 
 void screenWeatherSystem() {
   drawHeader("WEATHER & SYSTEM");
@@ -711,6 +867,19 @@ void displaySetup() {
     server.send(200, "text/plain", touch.dumpDebug());
   });
 
+  // Per-frame timing breakdown (see render()) -- for diagnosing the
+  // "stepped, not smooth" sweep animation without needing USB serial.
+  server.on("/timingdebug", []() {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+      "fillScreen: %lu us\nscreen draw: %lu us\npushFrame:  %lu us\ntotal work: %lu us\nactual frame interval: %lu ms\n",
+      (unsigned long)lastFillUs, (unsigned long)lastDrawUs, (unsigned long)lastPushUs,
+      (unsigned long)(lastFillUs + lastDrawUs + lastPushUs), (unsigned long)lastFrameIntervalMs);
+    server.send(200, "text/plain", buf);
+  });
+
+  initRGBPanel();
+  gfx->setBuffer(panelFbs[drawBufIdx]);  // inject BEFORE begin() so begin() skips its own allocation
   if (!gfx->begin()) {
     Serial.println("[lcd7b] Failed to initialize display!");
   }
@@ -718,8 +887,8 @@ void displaySetup() {
   gfx->setCursor(20, 100);
   gfx->setTextSize(4);
   gfx->setTextColor(GREEN);
-  gfx->print("CYD PLANE SPOTTER");
-  gfx->flush();
+  gfx->print("CYD PLANE SPOTTER (zero-copy dbuf)");
+  pushFrame();
   delay(1500);
 }
 
@@ -729,10 +898,10 @@ void connectWiFiShow() {
   gfx->setTextSize(3);
   gfx->setTextColor(WHITE);
   gfx->print("Connecting WiFi...");
-  gfx->flush();
+  pushFrame();
   connectWiFi();
   gfx->fillScreen(BLACK);
-  gfx->flush();
+  pushFrame();
 }
 
 void applyInvertColors(bool invert) {
@@ -744,34 +913,134 @@ void applyInvertColors(bool invert) {
   (void)invert;
 }
 
+void applyBrightness(uint8_t percent) {
+  ioExpander.setBacklight(percent);
+}
+
+// Radar screen only: full clear+redraw of the whole canvas (rings/compass/
+// blips/labels/left column) only periodically, when content can actually have
+// changed; the sweep line gets its own much faster update in between — erase
+// old position, draw new position, present. With zero-copy present, the
+// fast tick needs NO dirty-region crop/copy at all (the old pushPartial()
+// existed only to avoid a 1.2MB full-canvas copy per tick; a present is now
+// an O(1) buffer-index flip, so the whole pushPartial/crop-buffer machinery
+// is gone). The tick is gated by waitFrameDone() inside pushFrame(), so it
+// naturally runs at the panel's physical refresh rate — the fastest the
+// panel can ever show.
+//
+// Sweep erase position is tracked PER FRAMEBUFFER (prevSweepX/Y[2]): the two
+// driver buffers alternate on every present, so the buffer a fast tick draws
+// into contains the sweep line as of two ticks ago — each buffer must
+// remember where ITS OWN line was, or the erase misses and ghosts.
+void renderRadar(bool justEntered) {
+  static uint32_t lastFull = 0;
+  static uint32_t lastSweep = 0;
+  static int prevSweepX[2] = { RADAR_CX, RADAR_CX };
+  static int prevSweepY[2] = { RADAR_CY - RADAR_R, RADAR_CY - RADAR_R };
+  static bool havePrevSweep[2] = { false, false };
+  uint32_t now = millis();
+
+  bool needFull = justEntered || (now - lastFull >= 500);
+  if (needFull) {
+    lastFull = now;
+
+    uint32_t t0 = micros();
+    gfx->fillScreen(BLACK);
+    uint32_t t1 = micros();
+    if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+    screenRadar();
+    if (dataMutex) xSemaphoreGive(dataMutex);
+    uint32_t t2 = micros();
+
+    // Seed this buffer's erase position from the endpoint screenRadar()
+    // actually drew (recorded at draw time — NOT a fresh millis() here;
+    // recomputing after the slow draw/push was the original ghosting bug).
+    prevSweepX[drawBufIdx] = drawnSweepX;
+    prevSweepY[drawBufIdx] = drawnSweepY;
+    havePrevSweep[drawBufIdx] = true;
+
+    pushFrame();
+    uint32_t t3 = micros();
+    lastFillUs = t1 - t0; lastDrawUs = t2 - t1; lastPushUs = t3 - t2;
+
+    // Sync the OTHER framebuffer to the frame just presented. The two driver
+    // buffers alternate on screen, and between full redraws only the sweep
+    // line is updated (tracked per-buffer) — without this copy, every buffer
+    // flip visibly bounces blips/labels/clock back and forth between the
+    // states of the last two full redraws (~500ms apart). drawBufIdx has
+    // already flipped inside pushFrame(), so panelFbs[drawBufIdx] is the
+    // free buffer (waitFrameDone guaranteed it) and drawBufIdx^1 is the one
+    // just presented. Reading a buffer mid-scan is safe; writing it wouldn't
+    // be, which is why the copy direction matters.
+    memcpy(panelFbs[drawBufIdx], panelFbs[drawBufIdx ^ 1], (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+    prevSweepX[drawBufIdx] = drawnSweepX;
+    prevSweepY[drawBufIdx] = drawnSweepY;
+    havePrevSweep[drawBufIdx] = true;
+
+    lastSweep = now;
+    return;
+  }
+
+  if (now - lastSweep < 30) return;
+  lastSweep = now;
+
+  float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
+  double sw = deg2rad(sweepDeg);
+  int newX = RADAR_CX + (int)(sin(sw) * RADAR_R);
+  int newY = RADAR_CY - (int)(cos(sw) * RADAR_R);
+
+  if (havePrevSweep[drawBufIdx]) gfx->drawLine(RADAR_CX, RADAR_CY, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx], BLACK);
+  gfx->drawLine(RADAR_CX, RADAR_CY, newX, newY, GREEN);
+  prevSweepX[drawBufIdx] = newX;
+  prevSweepY[drawBufIdx] = newY;
+  havePrevSweep[drawBufIdx] = true;
+
+  pushFrame();
+}
+
 void render() {
+  // Tracked locally rather than via the shared `lastScreen` global: that
+  // global only gets touched from inside whichever path actually redraws,
+  // and since the radar path no longer runs on every render() call the way
+  // the others do, comparing against it here would go stale across quick
+  // navigation between screens. This little bit of state is dedicated to
+  // "did we just switch screens," independent of either path's own cadence.
+  static uint8_t prevScreenIdx = 255;  // sentinel forces a full redraw on first-ever call
+  uint8_t curScreenIdx = screen % LCD7B_NUM_SCREENS;
+  bool justEntered = (curScreenIdx != prevScreenIdx);
+  prevScreenIdx = curScreenIdx;
+
+  if (curScreenIdx == 2) {
+    renderRadar(justEntered);
+    return;
+  }
+
   static uint32_t lastDraw = 0;
   uint32_t now = millis();
-  // Radar needs a much shorter interval for a smooth sweep animation (the
-  // static info screens don't) — 300ms made the sweep visibly jump ~20deg
-  // per frame. 120ms is a middle ground: smoother without redrawing the
-  // radar's ~764x565 region (fillRect + rings + blips every cycle) often
-  // enough to risk the PSRAM/DMA bandwidth issue that caused the original
-  // rolling-image bug at a too-high pixel clock.
-  uint32_t interval = (screen % LCD7B_NUM_SCREENS == 2) ? 120 : 400;
-  if (now - lastDraw < interval) return;
+  if (!justEntered && now - lastDraw < 100) return;  // no animation on these screens, no need for a tight cadence
+  uint32_t frameInterval = now - lastDraw;
   lastDraw = now;
 
-  if (screen != lastScreen) {
-    gfx->fillScreen(BLACK);
-    lastScreen = screen;
-  }
+  uint32_t t0 = micros();
+  gfx->fillScreen(BLACK);
+  uint32_t t1 = micros();
 
   if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
   switch (screen % LCD7B_NUM_SCREENS) {
     case 0: screenTargetIntel();   break;
     case 1: screenTop5();          break;
-    case 2: screenRadar();         break;
     case 3: screenWeatherSystem(); break;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
+  uint32_t t2 = micros();
 
-  gfx->flush();
+  pushFrame();
+  uint32_t t3 = micros();
+
+  lastFillUs = t1 - t0;
+  lastDrawUs = t2 - t1;
+  lastPushUs = t3 - t2;
+  lastFrameIntervalMs = frameInterval;
 }
 
 void checkTouch() {

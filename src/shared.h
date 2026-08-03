@@ -22,6 +22,7 @@ extern double homeLat;
 extern double homeLon;
 extern float  radarMaxKm;
 extern bool   invertColors;  // true = light theme (hardware color invert)
+extern uint8_t brightness;   // backlight, 0-100
 // Radar blip label field toggles — all default off, user opts in via web UI
 extern bool   showCallsign;
 extern bool   showSpeed;
@@ -160,5 +161,6 @@ void initWebServer();
 void displaySetup();               // touch/display/sprite/canvas init + splash screen
 void connectWiFiShow();            // shows a "connecting" indicator, calls connectWiFi(), clears after
 void applyInvertColors(bool invert);
+void applyBrightness(uint8_t percent);  // 0-100
 void render();
 void checkTouch();

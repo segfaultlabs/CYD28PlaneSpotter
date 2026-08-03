@@ -132,18 +132,29 @@ static const int RADAR_R = 260;
 // between fetch cycles — a trail must follow one aircraft, not one array
 // slot. Lives here (not shared.h/data.cpp) since it's purely a rendering
 // concern local to this board's Radar screen.
-// TRAIL_LEN=6 initially made trails invisible: sampled once per "full" radar
-// redraw (~600ms), so 6 points was only ~3.6s of history -- barely a smear,
-// not a trail. 24 points covers ~14.4s, close to TRAIL_STALE_MS, so a trail
-// stays populated right up until it's actually evicted.
-#define TRAIL_LEN 24
+// 1800 samples ~= 15-30 min of history at this screen's 1-2Hz full-redraw
+// sampling rate -- long enough that no realistic single viewing session
+// should ever see a trail age out by hitting this cap; only true staleness
+// (TRAIL_STALE_MS, aircraft actually gone) should ever clear a trail. Backed
+// by PSRAM (ps_malloc, lazily allocated per slot and kept for the life of
+// the program) rather than a fixed struct member -- 1800*16 bytes*20 slots
+// is ~560KB, too big to want living in internal SRAM/.bss alongside
+// everything else, but trivial against this board's 8MB PSRAM.
+#define TRAIL_LEN 1800
 #define TRAIL_SLOTS MAX_BLIPS
 #define TRAIL_STALE_MS 15000  // drop a trail if its aircraft hasn't been seen in this long
 struct TrailHistory {
   char callsign[10] = {0};
-  double lat[TRAIL_LEN] = {0}, lon[TRAIL_LEN] = {0};
-  uint8_t count = 0;
+  double *lat = nullptr, *lon = nullptr;  // ps_malloc'd on first use, kept across resets
+  uint16_t count = 0;  // TRAIL_LEN > 255, so this can't be uint8_t
   uint32_t lastSeenMs = 0;
+  // Clears the trail's identity/content but keeps its PSRAM buffer
+  // allocated for reuse -- a plain `t = TrailHistory()` would instead null
+  // out lat/lon and leak the previous allocation.
+  void reset() { callsign[0] = 0; count = 0; lastSeenMs = 0; }
+  void ensureBuf() {
+    if (!lat) { lat = (double *)ps_malloc(sizeof(double) * TRAIL_LEN); lon = (double *)ps_malloc(sizeof(double) * TRAIL_LEN); }
+  }
 };
 static TrailHistory trails[TRAIL_SLOTS];
 
@@ -544,14 +555,15 @@ void screenRadar() {
         }
         if (slot < 0) {
           slot = oldest;
-          trails[slot] = TrailHistory();
+          trails[slot].reset();
           strncpy(trails[slot].callsign, blips[i].callsign, 9); trails[slot].callsign[9] = '\0';
         }
         TrailHistory &t = trails[slot];
+        t.ensureBuf();
         if (t.count < TRAIL_LEN) {
           t.lat[t.count] = blips[i].lat; t.lon[t.count] = blips[i].lon; t.count++;
         } else {
-          for (uint8_t j = 1; j < TRAIL_LEN; j++) { t.lat[j-1] = t.lat[j]; t.lon[j-1] = t.lon[j]; }
+          for (uint16_t j = 1; j < TRAIL_LEN; j++) { t.lat[j-1] = t.lat[j]; t.lon[j-1] = t.lon[j]; }
           t.lat[TRAIL_LEN-1] = blips[i].lat; t.lon[TRAIL_LEN-1] = blips[i].lon;
         }
         t.lastSeenMs = nowMs;
@@ -559,16 +571,24 @@ void screenRadar() {
       for (uint8_t s = 0; s < TRAIL_SLOTS; s++) {
         TrailHistory &t = trails[s];
         if (!t.callsign[0]) continue;
-        if (nowMs - t.lastSeenMs > TRAIL_STALE_MS) { t = TrailHistory(); continue; }
-        for (uint8_t j = 0; j < t.count; j++) {
+        if (nowMs - t.lastSeenMs > TRAIL_STALE_MS) { t.reset(); continue; }
+        // Connected polyline, not separate dots -- a trail of isolated 2-3px
+        // dots is nearly indistinguishable from noise at this scale (typical
+        // sample-to-sample movement is only a few px), and doesn't read as
+        // "a path" the way a real radar trace does. YELLOW, not DARKGREY:
+        // the three range rings are DARKGREY, so anything drawn in that same
+        // color blends straight into them.
+        int prevPx = 0, prevPy = 0; bool havePrev = false;
+        for (uint16_t j = 0; j < t.count; j++) {
           double dist = haversineKm(hLat, hLon, t.lat[j], t.lon[j]);
           float fr = (float)(dist / rMax);
-          if (fr > 1) continue;
+          if (fr > 1) { havePrev = false; continue; }
           int rr = (int)(fr * R);
           double brg = bearingDeg(hLat, hLon, t.lat[j], t.lon[j]);
           int px = cx + (int)(sin(deg2rad(brg)) * rr);
           int py = cy - (int)(cos(deg2rad(brg)) * rr);
-          gfx->fillCircle(px, py, 2, DARKGREY);
+          if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, YELLOW);
+          prevPx = px; prevPy = py; havePrev = true;
         }
       }
     }
@@ -746,6 +766,10 @@ void applyInvertColors(bool invert) {
   // software palette flip would mean touching every draw call; not worth it
   // for a nice-to-have. Dark Mode stays CYD/JC4832W535-only.
   (void)invert;
+}
+
+void applyBrightness(uint8_t percent) {
+  ioExpander.setBacklight(percent);
 }
 
 void render() {

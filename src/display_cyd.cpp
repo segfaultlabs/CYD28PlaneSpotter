@@ -817,3 +817,19 @@ void connectWiFiShow() {
 void applyInvertColors(bool invert) {
   tft.invertDisplay(invert);
 }
+
+// TFT_eSPI drives TFT_BL as a plain digitalWrite HIGH via its own init (see
+// TFT_BACKLIGHT_ON build flag) -- ledcAttachPin here takes the pin away from
+// that and puts it under PWM instead, so brightness can be graduated.
+#define BL_LEDC_CHANNEL 0
+#define BL_LEDC_FREQ 5000
+#define BL_LEDC_RES 8  // bits -> duty 0-255
+void applyBrightness(uint8_t percent) {
+  static bool ledcReady = false;
+  if (!ledcReady) {
+    ledcSetup(BL_LEDC_CHANNEL, BL_LEDC_FREQ, BL_LEDC_RES);
+    ledcAttachPin(TFT_BL, BL_LEDC_CHANNEL);
+    ledcReady = true;
+  }
+  ledcWrite(BL_LEDC_CHANNEL, (uint32_t)percent * 255 / 100);
+}

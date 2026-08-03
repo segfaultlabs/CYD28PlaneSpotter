@@ -569,6 +569,19 @@ void applyInvertColors(bool invert) {
   gfxPanel->invertDisplay(invert);
 }
 
+#define BL_LEDC_CHANNEL 0
+#define BL_LEDC_FREQ 5000
+#define BL_LEDC_RES 8  // bits -> duty 0-255
+void applyBrightness(uint8_t percent) {
+  static bool ledcReady = false;
+  if (!ledcReady) {
+    ledcSetup(BL_LEDC_CHANNEL, BL_LEDC_FREQ, BL_LEDC_RES);
+    ledcAttachPin(TFT_BL, BL_LEDC_CHANNEL);
+    ledcReady = true;
+  }
+  ledcWrite(BL_LEDC_CHANNEL, (uint32_t)percent * 255 / 100);
+}
+
 void render() {
   static uint32_t lastDraw = 0;
   uint32_t now = millis();
