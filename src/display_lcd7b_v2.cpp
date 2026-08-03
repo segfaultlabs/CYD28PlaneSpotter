@@ -54,6 +54,8 @@
 #define YELLOW RGB565_YELLOW
 #define DARKGREY RGB565_DARKGREY
 #define LIGHTGREY RGB565_LIGHTGREY
+#define MAGENTA RGB565_MAGENTA
+#define ORANGE 0xFD20
 
 // I2C bus shared by the IO-expander and GT911 touch
 #define I2C_SDA 8
@@ -98,6 +100,108 @@ static const int RADAR_AREA_W = LCD_W - RADAR_AREA_X, RADAR_AREA_H = LCD_H - HEA
 static const int RADAR_CX = RADAR_AREA_X + RADAR_AREA_W / 2;
 static const int RADAR_CY = RADAR_AREA_Y + RADAR_AREA_H / 2;
 static const int RADAR_R = 260;
+
+// Two radar layouts share one implementation: the classic view (left info
+// column + circle in the remaining area) and the full-screen view (no
+// header/column, circle fills the canvas, big touch buttons in the margins).
+// Which one is active depends on the current screen index — see
+// radarLayout().
+struct RadarLayout {
+  int cx, cy, R;                       // circle geometry
+  int boundX, boundY, boundW, boundH;  // label-placement bounds
+  bool full;                           // full-screen variant
+};
+static RadarLayout radarLayout(uint8_t scr) {
+  if (scr == 4) return { 512, 300, 285, 0, 0, LCD_W, LCD_H, true };
+  return { RADAR_CX, RADAR_CY, RADAR_R, RADAR_AREA_X, RADAR_AREA_Y, RADAR_AREA_W, RADAR_AREA_H, false };
+}
+
+// Physical airports plotted on the radar. Static table (IATA + coordinates)
+// — there is no practical live source for "airports near an arbitrary
+// point", and a static table is instant, works offline, and costs ~1.5KB of
+// flash. Weighted toward East Asia (primary dev location) plus world hubs.
+// Coordinates are airport reference points; at radar scale (10-200km) a few
+// hundred meters of error is invisible.
+struct AirportPt { const char *iata; float lat; float lon; };
+static const AirportPt AIRPORTS[] = {
+  // Korea / East Asia
+  { "ICN", 37.4602f, 126.4407f }, { "GMP", 37.5583f, 126.7906f },
+  { "CJJ", 36.7166f, 127.4991f }, { "PUS", 35.1795f, 128.9382f },
+  { "CJU", 33.5113f, 126.4930f }, { "TAE", 35.8941f, 128.6589f },
+  { "KWJ", 35.1264f, 126.8089f }, { "YNY", 38.0613f, 128.6691f },
+  { "OSN", 37.0906f, 127.0296f },
+  { "NRT", 35.7720f, 140.3929f }, { "HND", 35.5494f, 139.7798f },
+  { "KIX", 34.4342f, 135.2441f }, { "FUK", 33.5859f, 130.4500f },
+  { "CTS", 42.7752f, 141.6923f }, { "NGO", 34.8584f, 136.8053f },
+  { "OKA", 26.1958f, 127.6458f },
+  { "PEK", 40.0799f, 116.6031f }, { "PKX", 39.5098f, 116.4105f },
+  { "PVG", 31.1443f, 121.8083f }, { "SHA", 31.1979f, 121.3363f },
+  { "HKG", 22.3080f, 113.9185f }, { "MFM", 22.1496f, 113.5916f },
+  { "TPE", 25.0797f, 121.2342f }, { "TSA", 25.0697f, 121.5525f },
+  { "CAN", 23.3924f, 113.2988f }, { "SZX", 22.6393f, 113.8106f },
+  { "CTU", 30.5785f, 103.9471f }, { "XIY", 34.4471f, 108.7516f },
+  // North America
+  { "LAX", 33.9416f, -118.4085f }, { "JFK", 40.6413f, -73.7781f },
+  { "SFO", 37.6213f, -122.3790f }, { "ORD", 41.9742f, -87.9073f },
+  { "ATL", 33.6407f, -84.4277f }, { "DFW", 32.8998f, -97.0403f },
+  { "DEN", 39.8561f, -104.6737f }, { "SEA", 47.4502f, -122.3088f },
+  { "MIA", 25.7959f, -80.2870f }, { "BOS", 42.3656f, -71.0096f },
+  { "LAS", 36.0840f, -115.1537f }, { "YVR", 49.1967f, -123.1815f },
+  { "YYZ", 43.6777f, -79.6248f }, { "MEX", 19.4363f, -99.0721f },
+  { "HNL", 21.3245f, -157.9251f }, { "ANC", 61.1743f, -149.9962f },
+  // South America
+  { "GRU", -23.4356f, -46.4731f }, { "EZE", -34.8222f, -58.5358f },
+  { "SCL", -33.3930f, -70.7858f },
+  // Europe
+  { "LHR", 51.4700f, -0.4543f }, { "LGW", 51.1537f, -0.1821f },
+  { "CDG", 49.0097f, 2.5479f }, { "FRA", 50.0379f, 8.5622f },
+  { "AMS", 52.3105f, 4.7683f }, { "MAD", 40.4983f, -3.5676f },
+  { "FCO", 41.8003f, 12.2389f }, { "ZRH", 47.4647f, 8.5492f },
+  { "MUC", 48.3538f, 11.7861f }, { "VIE", 48.1103f, 16.5697f },
+  { "CPH", 55.6180f, 12.6560f }, { "ARN", 59.6519f, 17.9186f },
+  { "OSL", 60.1939f, 11.1004f }, { "HEL", 60.3172f, 24.9633f },
+  { "DUB", 53.4213f, -6.2701f }, { "BCN", 41.2974f, 2.0833f },
+  { "LIS", 38.7742f, -9.1342f }, { "ATH", 37.9364f, 23.9445f },
+  { "PRG", 50.1008f, 14.2600f }, { "WAW", 52.1657f, 20.9671f },
+  { "BUD", 47.4298f, 19.2611f }, { "IST", 41.2753f, 28.7519f },
+  // Middle East / Asia-Pacific / Africa
+  { "DXB", 25.2532f, 55.3657f }, { "DOH", 25.2731f, 51.6081f },
+  { "DEL", 28.5562f, 77.1000f }, { "BOM", 19.0896f, 72.8656f },
+  { "SIN", 1.3644f, 103.9915f }, { "BKK", 13.6900f, 100.7501f },
+  { "KUL", 2.7456f, 101.7099f }, { "CGK", -6.1256f, 106.6558f },
+  { "MNL", 14.5086f, 121.0194f }, { "SYD", -33.9399f, 151.1753f },
+  { "MEL", -37.6690f, 144.8410f }, { "AKL", -37.0082f, 174.7850f },
+  { "JNB", -26.1367f, 28.2411f }, { "CAI", 30.1219f, 31.4056f },
+};
+static const uint8_t AIRPORT_COUNT = sizeof(AIRPORTS) / sizeof(AIRPORTS[0]);
+
+// Trail classification: is an aircraft taking off / landing at a nearby
+// airport, or just flying over? Heuristic — low altitude + close to a known
+// airport + significant vertical rate. Kept simple on purpose: adsb.lol
+// gives no flight-plan phase, and route lookups are only opportunistically
+// cached, so vertical-rate-vs-airport-proximity is the most consistent
+// signal available on every blip.
+enum TrailClass : uint8_t { TC_OVER = 0, TC_DEP, TC_ARR };
+#define CLASS_NEAR_AIRPORT_KM 25.0
+#define CLASS_MAX_ALT_FT 12000.0f
+#define CLASS_VRATE_FPM 250
+static const uint16_t TRAIL_COLORS[3] = { YELLOW, CYAN, ORANGE };  // TC_OVER, TC_DEP, TC_ARR
+static TrailClass classifyBlip(const Blip &b) {
+  if (b.altitudeM * 3.28084f >= CLASS_MAX_ALT_FT) return TC_OVER;
+  for (uint8_t a = 0; a < AIRPORT_COUNT; a++) {
+    if (haversineKm(b.lat, b.lon, AIRPORTS[a].lat, AIRPORTS[a].lon) <= CLASS_NEAR_AIRPORT_KM) {
+      if (b.vrateFpm > CLASS_VRATE_FPM) return TC_DEP;
+      if (b.vrateFpm < -CLASS_VRATE_FPM) return TC_ARR;
+      return TC_OVER;
+    }
+  }
+  return TC_OVER;
+}
+static const Blip *findBlipByCallsign(const char *callsign) {
+  for (uint8_t i = 0; i < blipCount; i++)
+    if (strcmp(blips[i].callsign, callsign) == 0) return &blips[i];
+  return nullptr;
+}
 
 // Real double-buffered RGB panel, bypassing Arduino_GFX's RGB bus classes
 // entirely — confirmed by reading Arduino_ESP32RGBPanel's source directly
@@ -268,7 +372,7 @@ void pushFrame() {
 IOExtension ioExpander;
 GT911_Touch touch(TOUCH_INT, ioExpander);
 
-#define LCD7B_NUM_SCREENS 4  // Target Intel, Top 5, Radar, Weather & System
+#define LCD7B_NUM_SCREENS 5  // Target Intel, Top 5, Radar, Weather & System, Radar Full
 
 // Per-frame timing breakdown, updated every render() call, read via
 // GET /timingdebug -- so we can see exactly where a frame's time goes
@@ -411,6 +515,31 @@ void drawWeatherIcon(int x, int y, int code) {
     gfx->drawLine(x + 11, y + 16, x + 8, y + 21, YELLOW);
   } else {
     drawCloudShape(x, y, LIGHTGREY);
+  }
+}
+
+// Diamond marker for airports — distinct shape AND color (MAGENTA) so it
+// can't be confused with blips, traces, rings, or the sweep.
+static void drawAirportMarker(int px, int py, uint16_t color) {
+  gfx->drawLine(px, py - 6, px + 6, py, color);
+  gfx->drawLine(px + 6, py, px, py + 6, color);
+  gfx->drawLine(px, py + 6, px - 6, py, color);
+  gfx->drawLine(px - 6, py, px, py - 6, color);
+}
+
+// On-screen key explaining the trace classification colors + airport
+// marker. Drawn only when showTraces is on (no traces, nothing to explain).
+static void drawTrailKey(int x, int y) {
+  const char *labels[4] = { "TAKEOFF", "LANDING", "FLYOVER", "AIRPORT" };
+  gfx->setTextSize(2);
+  for (uint8_t i = 0; i < 4; i++) {
+    uint16_t c = (i < 3) ? TRAIL_COLORS[i] : MAGENTA;
+    if (i == 3) drawAirportMarker(x + 10, y + 8, MAGENTA);
+    else gfx->drawFastHLine(x, y + 8, 20, c);
+    gfx->setTextColor(c, BLACK);
+    gfx->setCursor(x + 30, y);
+    gfx->print(labels[i]);
+    y += 32;
   }
 }
 
@@ -580,16 +709,27 @@ static const int RNG_PLUS_Y = 380, RNG_MINUS_Y = 470;
 // the original "one paused line, one moving line" ghosting bug.
 static int drawnSweepX = RADAR_CX, drawnSweepY = RADAR_CY - RADAR_R;
 
+// Reads the radar-relevant config under configMutex into a snapshot struct,
+// shared by both radar screens.
+struct RadarCfg {
+  double hLat, hLon; float rMax;
+  bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
+};
+static RadarCfg radarCfgSnapshot() {
+  RadarCfg c;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  c.hLat = homeLat; c.hLon = homeLon; c.rMax = radarMaxKm;
+  c.showCS = showCallsign; c.showAir = showAirline; c.showSpd = showSpeed; c.showFlt = showFL; c.showRte = showRoute;
+  c.showRg = showReg; c.showSq = showSquawk; c.showVr = showVRate; c.showTy = showType;
+  if (configMutex) xSemaphoreGive(configMutex);
+  return c;
+}
+void drawRadarCommon(const RadarLayout &L);  // defined below screenRadar()
+
 void screenRadar() {
   drawHeader("RADAR");
 
-  double hLat, hLon; float rMax;
-  bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
-  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  hLat = homeLat; hLon = homeLon; rMax = radarMaxKm;
-  showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
-  showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType;
-  if (configMutex) xSemaphoreGive(configMutex);
+  RadarCfg cfg = radarCfgSnapshot();
 
   // --- Left info column ---
   // Every field here can change width between redraws (contact count,
@@ -629,7 +769,7 @@ void screenRadar() {
   gfx->setTextSize(3);
   gfx->setTextColor(CYAN, BLACK);
   gfx->setCursor(20, 320);
-  gfx->printf("RNG %d km   ", (int)rMax);
+  gfx->printf("RNG %d km   ", (int)cfg.rMax);
 
   gfx->fillRoundRect(RNG_BTN_X, RNG_PLUS_Y, RNG_BTN_W, RNG_BTN_H, 6, DARKGREY);
   gfx->setTextColor(WHITE, DARKGREY);
@@ -640,15 +780,16 @@ void screenRadar() {
   gfx->setCursor(RNG_BTN_X + 75, RNG_MINUS_Y + 18);
   gfx->print("-");
 
-  // --- Radar circle ---
-  // With a real double-buffered panel, this goes back to a plain full
-  // clear-and-redraw every cycle (render() already clears the whole canvas
-  // before calling this) — same as the JC4832W535. No more fast/slow
-  // cadence split or manual sweep-line erase-tracking; those existed only
-  // to minimize how much of a single, live-scanned buffer was visibly
-  // redrawn per frame, which no longer applies once nothing is visible
-  // until pushFrame() flips the buffer.
-  const int cx = RADAR_CX, cy = RADAR_CY, R = RADAR_R;
+  drawRadarCommon(radarLayout(2));
+}
+
+// Everything in/around the radar circle, shared by both radar screens:
+// rings/axes/compass, airport markers, sweep line, traces (+ color key),
+// blips, labels. Reads its own config snapshot. Full redraws only — the
+// sweep's fast per-frame update lives in renderRadar().
+void drawRadarCommon(const RadarLayout &L) {
+  RadarCfg cfg = radarCfgSnapshot();
+  const int cx = L.cx, cy = L.cy, R = L.R;
   uint32_t nowMs = millis();
   float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
   double sw = deg2rad(sweepDeg);
@@ -662,17 +803,43 @@ void screenRadar() {
   // Compass — matches the same north-up, clockwise convention already
   // used for blip placement (bx = cx + sin(brg)*r, by = cy - cos(brg)*r,
   // brg 0=N/90=E/180=S/270=W), so these letters are correct relative to
-  // where blips actually land, not just decorative.
+  // where blips actually land, not just decorative. Classic layout puts
+  // them OUTSIDE the circle (header/column leave margin); the full-screen
+  // layout's circle nearly touches the canvas edges, so they go INSIDE.
   gfx->setTextSize(2);
   gfx->setTextColor(LIGHTGREY, BLACK);
   int16_t lx1, ly1; uint16_t lw, lh;
   gfx->getTextBounds("N", 0, 0, &lx1, &ly1, &lw, &lh);
-  gfx->setCursor(cx - lw / 2, cy - R - lh - 6); gfx->print("N");
-  gfx->setCursor(cx - lw / 2, cy + R + 6); gfx->print("S");
-  gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
-  gfx->setCursor(cx + R + 8, cy - lh / 2); gfx->print("E");
-  gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
-  gfx->setCursor(cx - R - 8 - lw, cy - lh / 2); gfx->print("W");
+  if (L.full) {
+    gfx->setCursor(cx - lw / 2, cy - R + 6); gfx->print("N");
+    gfx->setCursor(cx - lw / 2, cy + R - lh - 6); gfx->print("S");
+    gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
+    gfx->setCursor(cx + R - lw - 8, cy - lh / 2); gfx->print("E");
+    gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
+    gfx->setCursor(cx - R + 8, cy - lh / 2); gfx->print("W");
+  } else {
+    gfx->setCursor(cx - lw / 2, cy - R - lh - 6); gfx->print("N");
+    gfx->setCursor(cx - lw / 2, cy + R + 6); gfx->print("S");
+    gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
+    gfx->setCursor(cx + R + 8, cy - lh / 2); gfx->print("E");
+    gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
+    gfx->setCursor(cx - R - 8 - lw, cy - lh / 2); gfx->print("W");
+  }
+
+  // --- Physical airports in range: MAGENTA diamond + IATA code ---
+  gfx->setTextColor(MAGENTA, BLACK);
+  for (uint8_t a = 0; a < AIRPORT_COUNT; a++) {
+    double dist = haversineKm(cfg.hLat, cfg.hLon, AIRPORTS[a].lat, AIRPORTS[a].lon);
+    float fr = (float)(dist / cfg.rMax);
+    if (fr > 1) continue;
+    int rr = (int)(fr * R);
+    double brg = bearingDeg(cfg.hLat, cfg.hLon, AIRPORTS[a].lat, AIRPORTS[a].lon);
+    int px = cx + (int)(sin(deg2rad(brg)) * rr);
+    int py = cy - (int)(cos(deg2rad(brg)) * rr);
+    drawAirportMarker(px, py, MAGENTA);
+    gfx->setCursor(px + 9, py - 8);
+    gfx->print(AIRPORTS[a].iata);
+  }
 
   drawnSweepX = cx + (int)(sin(sw) * R);
   drawnSweepY = cy - (int)(cos(sw) * R);
@@ -684,7 +851,9 @@ void screenRadar() {
   // callsign since blips[] array indices aren't stable between fetch
   // cycles. Sampled once per render cycle. Entries not seen in
   // TRAIL_STALE_MS are dropped, so a trail vanishes once its aircraft is
-  // no longer tracked (out of range / off screen).
+  // no longer tracked (out of range / off screen). Color encodes flight
+  // phase (see classifyBlip): CYAN takeoff / ORANGE landing near an
+  // airport, YELLOW flyover — key drawn below.
   if (showTraces) {
     for (uint8_t i = 0; i < blipCount; i++) {
       if (!blips[i].callsign[0]) continue;
@@ -715,22 +884,24 @@ void screenRadar() {
         // Connected polyline, not separate dots -- a trail of isolated 2-3px
         // dots is nearly indistinguishable from noise at this scale (typical
         // sample-to-sample movement is only a few px), and doesn't read as
-        // "a path" the way a real radar trace does. YELLOW, not DARKGREY:
-        // the three range rings are DARKGREY, so anything drawn in that same
-        // color blends straight into them.
+        // "a path" the way a real radar trace does.
+        const Blip *owner = findBlipByCallsign(t.callsign);
+        uint16_t trailColor = owner ? TRAIL_COLORS[classifyBlip(*owner)] : TRAIL_COLORS[TC_OVER];
         int prevPx = 0, prevPy = 0; bool havePrev = false;
         for (uint16_t j = 0; j < t.count; j++) {
-          double dist = haversineKm(hLat, hLon, t.lat[j], t.lon[j]);
-          float fr = (float)(dist / rMax);
+          double dist = haversineKm(cfg.hLat, cfg.hLon, t.lat[j], t.lon[j]);
+          float fr = (float)(dist / cfg.rMax);
           if (fr > 1) { havePrev = false; continue; }
           int rr = (int)(fr * R);
-          double brg = bearingDeg(hLat, hLon, t.lat[j], t.lon[j]);
+          double brg = bearingDeg(cfg.hLat, cfg.hLon, t.lat[j], t.lon[j]);
           int px = cx + (int)(sin(deg2rad(brg)) * rr);
           int py = cy - (int)(cos(deg2rad(brg)) * rr);
-          if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, YELLOW);
+          if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, trailColor);
           prevPx = px; prevPy = py; havePrev = true;
         }
     }
+    // Key sits in the corner of the radar area, clear of the circle.
+    drawTrailKey(L.full ? 830 : 870, L.full ? 420 : 460);
   }
 
   gfx->setTextSize(2);
@@ -743,12 +914,12 @@ void screenRadar() {
       if (blips[i].speedMs > 0 && elapsed > 0)
         projectLatLon(blips[i].lat, blips[i].lon, blips[i].track, blips[i].speedMs * elapsed, la, lo);
 
-      double dist = haversineKm(hLat, hLon, la, lo);
-      float fr = (float)(dist / rMax);
+      double dist = haversineKm(cfg.hLat, cfg.hLon, la, lo);
+      float fr = (float)(dist / cfg.rMax);
       if (fr > 1) continue;
 
       int rr = (int)(fr * R);
-      double brg = bearingDeg(hLat, hLon, la, lo);
+      double brg = bearingDeg(cfg.hLat, cfg.hLon, la, lo);
       int bx = cx + (int)(sin(deg2rad(brg)) * rr);
       int by = cy - (int)(cos(deg2rad(brg)) * rr);
 
@@ -764,43 +935,88 @@ void screenRadar() {
         int lineCount = 0;
         bool hasCallsign = blips[i].callsign[0] && strcmp(blips[i].callsign, "(no id)") != 0;
 
-        if (showCS && hasCallsign) {
+        if (cfg.showCS && hasCallsign) {
           strncpy(lines[lineCount], blips[i].callsign, 11); lines[lineCount][11] = '\0'; lineCount++;
         }
-        if (showFlt) {
+        if (cfg.showFlt) {
           float altFt = blips[i].altitudeM * 3.28084f;
           snprintf(lines[lineCount], 12, "FL%03.0f", altFt / 100.0f); lineCount++;
         }
-        if (showRte && blips[i].hasRoute) {
+        if (cfg.showRte && blips[i].hasRoute) {
           snprintf(lines[lineCount], 12, "%s>%s", blips[i].dep, blips[i].arr); lineCount++;
         }
-        if (showAir) {
+        if (cfg.showAir) {
           const char* airline = blips[i].airline[0] ? blips[i].airline : lookupAirline(blips[i].callsign);
           if (airline) {
             strncpy(lines[lineCount], airline, 10); lines[lineCount][10] = '\0'; lineCount++;
           }
         }
-        if (showRg && blips[i].reg[0]) {
+        if (cfg.showRg && blips[i].reg[0]) {
           strncpy(lines[lineCount], blips[i].reg, 11); lines[lineCount][11] = '\0'; lineCount++;
         }
-        if (showSq && blips[i].squawk[0]) {
+        if (cfg.showSq && blips[i].squawk[0]) {
           snprintf(lines[lineCount], 12, "SQ%s", blips[i].squawk); lineCount++;
         }
-        if (showVr) {
+        if (cfg.showVr) {
           snprintf(lines[lineCount], 12, "%+dfpm", blips[i].vrateFpm); lineCount++;
         }
-        if (showTy && blips[i].typeCode[0]) {
+        if (cfg.showTy && blips[i].typeCode[0]) {
           strncpy(lines[lineCount], blips[i].typeCode, 11); lines[lineCount][11] = '\0'; lineCount++;
         }
-        if (showSpd) {
+        if (cfg.showSpd) {
           float speedKt = blips[i].speedMs * 1.94384f;
           snprintf(lines[lineCount], 12, "%ukn", (unsigned int)(speedKt + 0.5f)); lineCount++;
         }
 
         placeLabel(placed, placedCount, MAX_BLIPS, bx, by, lines, lineCount,
-                   RADAR_AREA_X, RADAR_AREA_Y, RADAR_AREA_W, RADAR_AREA_H);
+                   L.boundX, L.boundY, L.boundW, L.boundH);
       }
     }
+}
+
+// Full-screen radar (screen index 4): no header, no left column — the
+// circle fills the whole canvas and everything else lives in the
+// corners/margins. Zoom buttons are much bigger than the classic layout's
+// column-cramped ones, per user request.
+static const int FRNG_BTN_X = 20, FRNG_BTN_W = 195, FRNG_BTN_H = 85;
+static const int FRNG_PLUS_Y = 405, FRNG_MINUS_Y = 500;
+
+void screenRadarFull() {
+  RadarCfg cfg = radarCfgSnapshot();
+  drawRadarCommon(radarLayout(4));
+
+  // Weather, top-left corner
+  gfx->setTextSize(2);
+  if (weather.valid) {
+    drawWeatherIcon(15, 12, weather.code);
+    gfx->setTextColor(CYAN, BLACK);
+    gfx->setCursor(50, 16);
+    gfx->printf("%.1fC   ", weather.tempC);
+  }
+
+  // Contacts + nearest, top-right corner
+  gfx->setTextColor(WHITE, BLACK);
+  gfx->setCursor(830, 12);
+  gfx->printf("Contacts: %u   ", blipCount);
+  gfx->setTextColor(CYAN, BLACK);
+  gfx->setCursor(830, 40);
+  if (nearest.valid) gfx->printf("%-11s", nearest.callsign);
+  else gfx->print("No TGT     ");
+
+  // Range + big zoom buttons, bottom-left margin
+  gfx->setTextSize(3);
+  gfx->setTextColor(CYAN, BLACK);
+  gfx->setCursor(20, 350);
+  gfx->printf("RNG %d km   ", (int)cfg.rMax);
+
+  gfx->fillRoundRect(FRNG_BTN_X, FRNG_PLUS_Y, FRNG_BTN_W, FRNG_BTN_H, 8, DARKGREY);
+  gfx->setTextColor(WHITE, DARKGREY);
+  gfx->setCursor(FRNG_BTN_X + 85, FRNG_PLUS_Y + 25);
+  gfx->print("+");
+
+  gfx->fillRoundRect(FRNG_BTN_X, FRNG_MINUS_Y, FRNG_BTN_W, FRNG_BTN_H, 8, DARKGREY);
+  gfx->setCursor(FRNG_BTN_X + 85, FRNG_MINUS_Y + 25);
+  gfx->print("-");
 }
 
 
@@ -878,6 +1094,23 @@ void displaySetup() {
     server.send(200, "text/plain", buf);
   });
 
+  // Device health snapshot for remote monitoring (slowdown/crash-watch):
+  // memory floors, reset reason, frame timings, data-fetch stats.
+  server.on("/health", []() {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+      "uptime_s: %lu\nreset_reason: %d\nheap_free: %u\nheap_min_free: %u\npsram_free: %u\n"
+      "rssi_dbm: %d\nscreen: %u\nfill_us: %lu\ndraw_us: %lu\npush_us: %lu\nframe_interval_ms: %lu\n"
+      "blips: %u\napi_ok: %lu\napi_fail: %lu\n",
+      (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
+      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getFreePsram(),
+      (int)WiFi.RSSI(), screen,
+      (unsigned long)lastFillUs, (unsigned long)lastDrawUs, (unsigned long)lastPushUs,
+      (unsigned long)lastFrameIntervalMs,
+      blipCount, (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail);
+    server.send(200, "text/plain", buf);
+  });
+
   initRGBPanel();
   gfx->setBuffer(panelFbs[drawBufIdx]);  // inject BEFORE begin() so begin() skips its own allocation
   if (!gfx->begin()) {
@@ -940,6 +1173,9 @@ void renderRadar(bool justEntered) {
   static bool havePrevSweep[2] = { false, false };
   uint32_t now = millis();
 
+  uint8_t cur = screen % LCD7B_NUM_SCREENS;
+  const RadarLayout L = radarLayout(cur);
+
   bool needFull = justEntered || (now - lastFull >= 500);
   if (needFull) {
     lastFull = now;
@@ -948,11 +1184,12 @@ void renderRadar(bool justEntered) {
     gfx->fillScreen(BLACK);
     uint32_t t1 = micros();
     if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
-    screenRadar();
+    if (cur == 4) screenRadarFull();
+    else screenRadar();
     if (dataMutex) xSemaphoreGive(dataMutex);
     uint32_t t2 = micros();
 
-    // Seed this buffer's erase position from the endpoint screenRadar()
+    // Seed this buffer's erase position from the endpoint the screen
     // actually drew (recorded at draw time — NOT a fresh millis() here;
     // recomputing after the slow draw/push was the original ghosting bug).
     prevSweepX[drawBufIdx] = drawnSweepX;
@@ -986,11 +1223,11 @@ void renderRadar(bool justEntered) {
 
   float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
   double sw = deg2rad(sweepDeg);
-  int newX = RADAR_CX + (int)(sin(sw) * RADAR_R);
-  int newY = RADAR_CY - (int)(cos(sw) * RADAR_R);
+  int newX = L.cx + (int)(sin(sw) * L.R);
+  int newY = L.cy - (int)(cos(sw) * L.R);
 
-  if (havePrevSweep[drawBufIdx]) gfx->drawLine(RADAR_CX, RADAR_CY, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx], BLACK);
-  gfx->drawLine(RADAR_CX, RADAR_CY, newX, newY, GREEN);
+  if (havePrevSweep[drawBufIdx]) gfx->drawLine(L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx], BLACK);
+  gfx->drawLine(L.cx, L.cy, newX, newY, GREEN);
   prevSweepX[drawBufIdx] = newX;
   prevSweepY[drawBufIdx] = newY;
   havePrevSweep[drawBufIdx] = true;
@@ -1010,7 +1247,7 @@ void render() {
   bool justEntered = (curScreenIdx != prevScreenIdx);
   prevScreenIdx = curScreenIdx;
 
-  if (curScreenIdx == 2) {
+  if (curScreenIdx == 2 || curScreenIdx == 4) {
     renderRadar(justEntered);
     return;
   }
@@ -1055,10 +1292,17 @@ void checkTouch() {
   int sx = constrain((int)x, 0, LCD_W - 1);
   int sy = constrain((int)y, 0, LCD_H - 1);
 
-  if (screen % LCD7B_NUM_SCREENS == 2) {
-    // Radar screen: check +/- range buttons in the left info column
-    if (sx >= RNG_BTN_X && sx <= RNG_BTN_X + RNG_BTN_W &&
-        sy >= RNG_PLUS_Y && sy <= RNG_PLUS_Y + RNG_BTN_H) {
+  uint8_t cur = screen % LCD7B_NUM_SCREENS;
+  if (cur == 2 || cur == 4) {
+    // Radar screens: check +/- range buttons (classic layout keeps them in
+    // the left info column; the full-screen layout has its own bigger set
+    // in the bottom-left margin).
+    const int bx  = (cur == 4) ? FRNG_BTN_X   : RNG_BTN_X;
+    const int bw  = (cur == 4) ? FRNG_BTN_W   : RNG_BTN_W;
+    const int bh  = (cur == 4) ? FRNG_BTN_H   : RNG_BTN_H;
+    const int py  = (cur == 4) ? FRNG_PLUS_Y  : RNG_PLUS_Y;
+    const int my  = (cur == 4) ? FRNG_MINUS_Y : RNG_MINUS_Y;
+    if (sx >= bx && sx <= bx + bw && sy >= py && sy <= py + bh) {
       if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
       radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
       if (configMutex) xSemaphoreGive(configMutex);
@@ -1066,8 +1310,7 @@ void checkTouch() {
       Serial.printf("[lcd7b] Range increased: %d km\n", (int)radarMaxKm);
       return;
     }
-    if (sx >= RNG_BTN_X && sx <= RNG_BTN_X + RNG_BTN_W &&
-        sy >= RNG_MINUS_Y && sy <= RNG_MINUS_Y + RNG_BTN_H) {
+    if (sx >= bx && sx <= bx + bw && sy >= my && sy <= my + bh) {
       if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
       radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
       if (configMutex) xSemaphoreGive(configMutex);

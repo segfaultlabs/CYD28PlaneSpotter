@@ -56,6 +56,11 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 - **Weather & System** — live temperature, humidity, and wind from Open-Meteo, plus system stats (uptime, WiFi RSSI, free RAM, API request counters).
 - **Web Configuration** — built-in web server to change home location, radar range, and dark mode from any browser on the same network.
 - **Over-the-air firmware updates** — a "Firmware Update" upload form on the same web config page flashes a new `.bin` over WiFi (`POST /update`, backed by the standard ESP32 `Update` library) and reboots into it — no USB cable needed after the first flash. Works identically on all three boards, since it's part of the shared `data.cpp` web server.
+- **LCD-7B v2 display engine** — the 7" board has a second, experimental firmware variant (`env:lcd7b_v2`) that bypasses Arduino_GFX's single-buffered RGB panel and drives the ST7701 via raw ESP-IDF with true double buffering and zero-copy presents (the canvas rasterizes directly into the panel driver's framebuffers), running at 20MHz pclk for a ~21.8Hz physical refresh — a smooth radar sweep. See `LCD7B_V2_DEBUG_LOG.md` for the full engineering history.
+- **Airport markers** — physical airports within radar range are plotted as magenta diamonds with IATA codes (built-in ~80-airport coordinate table, weighted to East Asia + world hubs).
+- **Flight-phase trace colors** — radar traces are classified by airport proximity + vertical rate: cyan = taking off, orange = landing, yellow = flying over, with an on-screen color key. Toggled with the existing traces switch.
+- **Full-screen radar (LCD-7B v2)** — a fifth screen using the entire 1024×600 canvas for the radar, with large touch zoom buttons in the margin.
+- **Remote health endpoint** — `GET /health` on the LCD-7B v2 reports uptime, reset reason, heap/PSRAM floors, RSSI, frame timings and API stats for remote slowdown/crash monitoring (alongside the existing `/timingdebug` and `/gt911debug`).
 - **Dual-core architecture** — HTTP/API calls run on Core 0 (FreeRTOS task), UI rendering and touch handling run on Core 1, keeping the display smooth.
 
 ## Hardware
@@ -70,7 +75,8 @@ The changes above are the *what*; a few of them involved real tradeoffs worth ex
 - **Display**: AXS15231B over QSPI, native 320×480, software-rotated to 480×320 landscape
 - **Touch**: AXS15231B integrated capacitive touch over I2C (vendored driver, `src/AXS15231B_touch.{h,cpp}`)
 
-**ESP32-S3-Touch-LCD-7B (`env:lcd7b`)** — minimal bring-up (WiFi/aircraft-count/nearest-callsign screen; full UI is a Roadmap item)
+**ESP32-S3-Touch-LCD-7B (`env:lcd7b`)** — full 4-screen UI (Target Intel, Top 5, Radar, Weather & System); single-buffered Arduino_GFX build, kept as the proven fallback
+**ESP32-S3-Touch-LCD-7B v2 (`env:lcd7b_v2`)** — same hardware, full 5-screen UI (adds full-screen Radar); raw ESP-IDF zero-copy double-buffered display engine at 20MHz pclk (see Features / `LCD7B_V2_DEBUG_LOG.md`)
 - **Board**: ESP32-S3-WROOM-1-N16R8 (16MB flash, 8MB PSRAM), Waveshare ESP32-S3-Touch-LCD-7B
 - **Display**: ST7701, direct RGB-parallel (16-bit data bus + HSYNC/VSYNC/DE/PCLK), 1024×600, no vendor init sequence needed
 - **Touch**: GT911 capacitive touch over I2C (hand-rolled driver, `src/GT911_touch.{h,cpp}`); reset and backlight run through an I2C GPIO-expander (`src/IOExtension.{h,cpp}`), not direct GPIOs
@@ -144,6 +150,25 @@ CYD28/
 
 Ideas noted for future work, not yet implemented:
 
+- **Much better WiFi management** — multiple saved networks with priority ordering, automatic fallback to a config AP mode when nothing known is reachable (see the QR-provisioning idea below), sensible reconnect backoff instead of the current blocking-reconnect loop, and on-screen WiFi status/diagnostics (SSID, RSSI, IP, reconnect count).
+- **On-screen touch controls for everything** — a settings screen on the device itself: label-field toggles, traces on/off, brightness slider, radar range, screen selection — so the web config page becomes optional rather than the only way to change anything. Needs a touch widget toolkit (buttons, toggles, sliders) shared across boards.
+- **Radar rotation / true-north alignment** — a configurable heading offset (mounting angle of the physical installation + magnetic declination if we ever go magnetic) applied to all bearings, so the "N" on screen can be made to point at real-world north regardless of how the panel is oriented on the wall. Persisted, adjustable in fine steps.
+- **30MHz pclk for the LCD-7B v2 (~33Hz refresh)** — currently at 20MHz (~21.8Hz), the ceiling for octal PSRAM @80MHz. Going higher needs the `custom_sdkconfig` rebuild recipe (120MHz PSRAM + flash, 64B cache line, XIP-from-PSRAM, IRAM-safe RGB ISR) documented in HANDOFF.md — experimental Espressif feature, unverified on this board's R8V chip variant.
+- **Squawk/emergency highlighting** — blips squawking 7500/7600/7700 drawn in flashing red with an alert line on the radar screens.
+- **Watchlist alerts** — user-configured callsigns/registrations/type codes (via web UI) get highlighted blips/labels and a log entry when they enter range.
+- **Altitude-banded blip colors** — color blips by flight-level band (ground/low/mid/high) so traffic density reads at a glance.
+- **Trail age fading** — older trail segments progressively dimmer toward the tail; trail duration configurable from the web UI instead of the compiled-in constant.
+- **Trail classification v2** — when adsbdb route data is cached for an aircraft, classify its trail against its *actual* origin/destination airport instead of the current any-nearby-airport heuristic, and mark which airport it's departing/arriving in the label.
+- **Tap-an-airport info** — touch hit-testing on airport markers: tapping one shows its name, distance and bearing (needs a slightly larger airport table with names).
+- **Bigger airport dataset** — the built-in table is ~80 hand-picked airports; generate a full regional set from OurAirports data at build time, with per-region tables selected by configured home location.
+- **Range ring labels** — annotate each range ring with its distance value (e.g. "50 km") along the top axis.
+- **Screen auto-cycle (kiosk mode)** — optional timed rotation through the screens with configurable dwell per screen; any touch returns to manual.
+- **Auto-dim / night mode** — backlight dimming on a schedule (or via an ambient light sensor if one gets wired up), so the panel isn't blazing in a dark room.
+- **Statistics & logging** — aircraft seen per day, closest-ever pass, busiest hours; persisted to LittleFS and viewable on a stats screen.
+- **MQTT / Home Assistant push** — publish traffic events (new aircraft, watchlist hits, emergencies) to a broker for home-automation integration.
+- **Unit preferences** — ft/m, knots/km/h/mph, km/nm for range; configurable via web UI (and the touch settings screen once that exists).
+- **Gesture navigation** — swipe left/right to move between screens instead of tap-to-cycle-anywhere (frees taps for per-screen interactions like the airport info idea above).
+- **Weather radar overlay** — precipitation tiles (e.g. RainViewer) underlaid on the radar screen. Memory/bandwidth-heavy for this hardware — would need tile downscaling and aggressive caching.
 - **Arrivals/departures board per nearby airport** — a dedicated screen (one per airport, e.g. GMP and ICN for the primary dev setup) listing upcoming arrivals and departures at that specific airport, rather than the existing Top 5/Target Intel screens which are organized by distance from home location instead of by airport.
 - **On-hardware touch calibration for the JC4832W535** — the current touch offsets are a placeholder spanning the full native panel range; `checkTouch()` logs raw coordinates to Serial specifically so real calibration data can be gathered and the offsets tuned.
 - **WiFi provisioning via AP-mode + QR code** — when the device has no working WiFi credentials, boot into a temporary AP mode and show a QR code on-screen encoding the standard `WIFI:` connection format, so scanning it with a phone connects directly to the device's setup network (no manually typing the SSID/password) and lands on the existing captive-portal-style config page to enter real credentials. Not started.
