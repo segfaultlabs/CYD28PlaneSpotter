@@ -365,7 +365,17 @@ public:
   DirectCanvas(int16_t w, int16_t h) : Arduino_Canvas(w, h, nullptr) {}
   void setBuffer(uint16_t *buf) { _framebuffer = buf; }
 };
-DirectCanvas *gfx = new DirectCanvas(LCD_W, LCD_H);
+DirectCanvas *directGfx = new DirectCanvas(LCD_W, LCD_H);
+
+// The global rendering target. Points at directGfx (one of the panel
+// framebuffers) except while a staged redraw is rendering into the staging
+// canvas — all screen code draws through this, unaware of the retargeting.
+Arduino_GFX *gfx = directGfx;
+
+// Third PSRAM framebuffer: the staged radar redraw renders the next frame
+// here in small slices between sweep ticks, then it's band-copied into the
+// panel framebuffers (see renderRadar). Allocated in displaySetup().
+static Arduino_Canvas *stagingCanvas = nullptr;
 
 // Presents the just-drawn frame: hands the driver the pointer of the buffer
 // the canvas drew into. Verified against esp_lcd_panel_rgb.c @ v5.5.5 (the
@@ -384,7 +394,7 @@ void pushFrame() {
   esp_lcd_panel_draw_bitmap(panelHandle, 0, 0, LCD_W, LCD_H, panelFbs[drawBufIdx]);
   waitFrameDone();
   drawBufIdx ^= 1;
-  gfx->setBuffer(panelFbs[drawBufIdx]);
+  directGfx->setBuffer(panelFbs[drawBufIdx]);
 }
 
 IOExtension ioExpander;
@@ -719,6 +729,9 @@ void screenTop5() {
 // "-" / "+" button hit-rects, shared between the draw code below and checkTouch().
 static const int RNG_BTN_X = 30, RNG_BTN_W = 180, RNG_BTN_H = 70;
 static const int RNG_PLUS_Y = 380, RNG_MINUS_Y = 470;
+// Full-screen radar's bigger set, bottom-left margin.
+static const int FRNG_BTN_X = 20, FRNG_BTN_W = 195, FRNG_BTN_H = 85;
+static const int FRNG_PLUS_Y = 405, FRNG_MINUS_Y = 500;
 
 // The sweep-line endpoint screenRadar() ACTUALLY drew on its last full
 // redraw, recorded at draw time. renderRadar() seeds its per-buffer erase
@@ -752,12 +765,64 @@ static RadarCfg radarCfgSnapshot() {
   if (configMutex) xSemaphoreGive(configMutex);
   return c;
 }
-void drawRadarCommon(const RadarLayout &L);  // defined below screenRadar()
+void drawRadarFurniture(const RadarLayout &L, const RadarCfg &cfg);
+void drawRadarStatic(const RadarLayout &L, const RadarCfg &cfg);
+void drawRadarTrails(const RadarLayout &L, const RadarCfg &cfg, uint8_t slotFrom, uint8_t slotTo);
+void drawRadarBlips(const RadarLayout &L, const RadarCfg &cfg);
 
-void screenRadar() {
-  drawHeader("RADAR");
-
+// Full radar frame, used by the monolithic redraw path (screen entry).
+void drawRadarAll(const RadarLayout &L) {
   RadarCfg cfg = radarCfgSnapshot();
+  drawRadarFurniture(L, cfg);
+  drawRadarStatic(L, cfg);
+  drawRadarTrails(L, cfg, 0, TRAIL_SLOTS);
+  drawRadarBlips(L, cfg);
+}
+
+void screenRadar() { drawRadarAll(radarLayout(2)); }
+void screenRadarFull() { drawRadarAll(radarLayout(4)); }
+
+// Screen furniture around the radar circle: header + left info column +
+// zoom buttons (classic layout), or corner readouts + big zoom buttons
+// (full-screen layout).
+void drawRadarFurniture(const RadarLayout &L, const RadarCfg &cfg) {
+  if (L.full) {
+    // Weather, top-left corner
+    gfx->setTextSize(2);
+    if (weather.valid) {
+      drawWeatherIcon(15, 12, weather.code);
+      gfx->setTextColor(CYAN, BLACK);
+      gfx->setCursor(50, 16);
+      gfx->printf("%.1fC   ", weather.tempC);
+    }
+
+    // Contacts + nearest, top-right corner
+    gfx->setTextColor(WHITE, BLACK);
+    gfx->setCursor(830, 12);
+    gfx->printf("Contacts: %u   ", blipCount);
+    gfx->setTextColor(CYAN, BLACK);
+    gfx->setCursor(830, 40);
+    if (nearest.valid) gfx->printf("%-11s", nearest.callsign);
+    else gfx->print("No TGT     ");
+
+    // Range + big zoom buttons, bottom-left margin
+    gfx->setTextSize(3);
+    gfx->setTextColor(CYAN, BLACK);
+    gfx->setCursor(20, 350);
+    gfx->printf("RNG %d km   ", (int)cfg.rMax);
+
+    gfx->fillRoundRect(FRNG_BTN_X, FRNG_PLUS_Y, FRNG_BTN_W, FRNG_BTN_H, 8, DARKGREY);
+    gfx->setTextColor(WHITE, DARKGREY);
+    gfx->setCursor(FRNG_BTN_X + 85, FRNG_PLUS_Y + 25);
+    gfx->print("+");
+
+    gfx->fillRoundRect(FRNG_BTN_X, FRNG_MINUS_Y, FRNG_BTN_W, FRNG_BTN_H, 8, DARKGREY);
+    gfx->setCursor(FRNG_BTN_X + 85, FRNG_MINUS_Y + 25);
+    gfx->print("-");
+    return;
+  }
+
+  drawHeader("RADAR");
 
   // --- Left info column ---
   // Every field here can change width between redraws (contact count,
@@ -807,16 +872,12 @@ void screenRadar() {
   gfx->fillRoundRect(RNG_BTN_X, RNG_MINUS_Y, RNG_BTN_W, RNG_BTN_H, 6, DARKGREY);
   gfx->setCursor(RNG_BTN_X + 75, RNG_MINUS_Y + 18);
   gfx->print("-");
-
-  drawRadarCommon(radarLayout(2));
 }
 
-// Everything in/around the radar circle, shared by both radar screens:
-// rings/axes/compass, airport markers, sweep line, traces (+ color key),
-// blips, labels. Reads its own config snapshot. Full redraws only — the
-// sweep's fast per-frame update lives in renderRadar().
-void drawRadarCommon(const RadarLayout &L) {
-  RadarCfg cfg = radarCfgSnapshot();
+// Rings/axes, compass, airports, sweep line (records drawnSweepX/Y), and
+// trail sampling. Split from drawRadarTrails/drawRadarBlips so the staged
+// redraw (renderRadar) can render each part in its own time slice.
+void drawRadarStatic(const RadarLayout &L, const RadarCfg &cfg) {
   const int cx = L.cx, cy = L.cy, R = L.R;
   uint32_t nowMs = millis();
   float sweepDeg = fmodf(millis() / (cfg.swpSec * 1000.0f / 360.0f), 360.0f);
@@ -877,15 +938,9 @@ void drawRadarCommon(const RadarLayout &L) {
   drawnSweepY = cy - (int)(cos(sw) * R);
   gfx->drawLine(cx, cy, drawnSweepX, drawnSweepY, cfg.cSweep);
 
-  float elapsed = (millis() - lastDataMs) / 1000.0f;
-
-  // --- Flight path traces: per-aircraft position history, keyed by
-  // callsign since blips[] array indices aren't stable between fetch
-  // cycles. Sampled once per render cycle. Entries not seen in
-  // trailStaleSec are dropped, so a trail vanishes once its aircraft is
-  // no longer tracked (out of range / off screen). Color encodes flight
-  // phase (see classifyBlip) — all three colors and the thresholds are
-  // configurable via the web UI; key drawn below.
+  // --- Trail sampling: append one position per aircraft per redraw cycle.
+  // Keyed by callsign since blips[] array indices aren't stable between
+  // fetch cycles. Cap is runtime-configurable (trailMaxSamples).
   if (showTraces) {
     for (uint8_t i = 0; i < blipCount; i++) {
       if (!blips[i].callsign[0]) continue;
@@ -919,35 +974,53 @@ void drawRadarCommon(const RadarLayout &L) {
       }
       t.lastSeenMs = nowMs;
     }
-    const uint16_t trailColors[3] = { cfg.cTrOver, cfg.cTrDep, cfg.cTrArr };  // TC_OVER, TC_DEP, TC_ARR
-    for (uint8_t s = 0; s < TRAIL_SLOTS; s++) {
-      TrailHistory &t = trails[s];
-      if (!t.callsign[0]) continue;
-      if (nowMs - t.lastSeenMs > (uint32_t)cfg.trailStale * 1000UL) { t.reset(); continue; }
-        // Connected polyline, not separate dots -- a trail of isolated 2-3px
-        // dots is nearly indistinguishable from noise at this scale (typical
-        // sample-to-sample movement is only a few px), and doesn't read as
-        // "a path" the way a real radar trace does.
-        const Blip *owner = findBlipByCallsign(t.callsign);
-        uint16_t trailColor = owner ? trailColors[classifyBlip(*owner, cfg.cNear, cfg.cAlt, cfg.cVr)] : cfg.cTrOver;
-        int prevPx = 0, prevPy = 0; bool havePrev = false;
-        for (uint16_t j = 0; j < t.count; j++) {
-          float dist, brg;
-          trailPolar((float)cfg.hLat, (float)cfg.hLon, (float)t.lat[j], (float)t.lon[j], dist, brg);
-          float fr = dist / cfg.rMax;
-          if (fr > 1) { havePrev = false; continue; }
-          int rr = (int)(fr * R);
-          float br = brg * (float)PI / 180.0f;
-          int px = cx + (int)(sinf(br) * rr);
-          int py = cy - (int)(cosf(br) * rr);
-          if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, trailColor);
-          prevPx = px; prevPy = py; havePrev = true;
-        }
-    }
-    // Key sits in the corner of the radar area, clear of the circle.
-    if (cfg.sKey) drawTrailKey(L.full ? 830 : 870, L.full ? 420 : 460,
-                               cfg.cTrDep, cfg.cTrArr, cfg.cTrOver, cfg.cAirpt);
   }
+}
+
+// Trails for trail slots [slotFrom, slotTo) + the color key (on the final
+// slice). Color encodes flight phase (see classifyBlip) — all three colors
+// and the thresholds are configurable via the web UI. Entries not seen in
+// trailStaleSec are dropped.
+void drawRadarTrails(const RadarLayout &L, const RadarCfg &cfg, uint8_t slotFrom, uint8_t slotTo) {
+  if (!showTraces) return;
+  const int cx = L.cx, cy = L.cy, R = L.R;
+  uint32_t nowMs = millis();
+  const uint16_t trailColors[3] = { cfg.cTrOver, cfg.cTrDep, cfg.cTrArr };  // TC_OVER, TC_DEP, TC_ARR
+  for (uint8_t s = slotFrom; s < slotTo; s++) {
+    TrailHistory &t = trails[s];
+    if (!t.callsign[0]) continue;
+    if (nowMs - t.lastSeenMs > (uint32_t)cfg.trailStale * 1000UL) { t.reset(); continue; }
+      // Connected polyline, not separate dots -- a trail of isolated 2-3px
+      // dots is nearly indistinguishable from noise at this scale (typical
+      // sample-to-sample movement is only a few px), and doesn't read as
+      // "a path" the way a real radar trace does.
+      const Blip *owner = findBlipByCallsign(t.callsign);
+      uint16_t trailColor = owner ? trailColors[classifyBlip(*owner, cfg.cNear, cfg.cAlt, cfg.cVr)] : cfg.cTrOver;
+      int prevPx = 0, prevPy = 0; bool havePrev = false;
+      for (uint16_t j = 0; j < t.count; j++) {
+        float dist, brg;
+        trailPolar((float)cfg.hLat, (float)cfg.hLon, (float)t.lat[j], (float)t.lon[j], dist, brg);
+        float fr = dist / cfg.rMax;
+        if (fr > 1) { havePrev = false; continue; }
+        int rr = (int)(fr * R);
+        float br = brg * (float)PI / 180.0f;
+        int px = cx + (int)(sinf(br) * rr);
+        int py = cy - (int)(cosf(br) * rr);
+        if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, trailColor);
+        prevPx = px; prevPy = py; havePrev = true;
+      }
+  }
+  // Key sits in the corner of the radar area, clear of the circle.
+  if (slotTo >= TRAIL_SLOTS && cfg.sKey)
+    drawTrailKey(L.full ? 830 : 870, L.full ? 420 : 460,
+                 cfg.cTrDep, cfg.cTrArr, cfg.cTrOver, cfg.cAirpt);
+}
+
+// Blips (projected positions) + their collision-avoided labels.
+void drawRadarBlips(const RadarLayout &L, const RadarCfg &cfg) {
+  const int cx = L.cx, cy = L.cy, R = L.R;
+  float sweepDeg = fmodf(millis() / (cfg.swpSec * 1000.0f / 360.0f), 360.0f);
+  float elapsed = (millis() - lastDataMs) / 1000.0f;
 
   gfx->setTextSize(2);
 
@@ -1019,52 +1092,6 @@ void drawRadarCommon(const RadarLayout &L) {
       }
     }
 }
-
-// Full-screen radar (screen index 4): no header, no left column — the
-// circle fills the whole canvas and everything else lives in the
-// corners/margins. Zoom buttons are much bigger than the classic layout's
-// column-cramped ones, per user request.
-static const int FRNG_BTN_X = 20, FRNG_BTN_W = 195, FRNG_BTN_H = 85;
-static const int FRNG_PLUS_Y = 405, FRNG_MINUS_Y = 500;
-
-void screenRadarFull() {
-  RadarCfg cfg = radarCfgSnapshot();
-  drawRadarCommon(radarLayout(4));
-
-  // Weather, top-left corner
-  gfx->setTextSize(2);
-  if (weather.valid) {
-    drawWeatherIcon(15, 12, weather.code);
-    gfx->setTextColor(CYAN, BLACK);
-    gfx->setCursor(50, 16);
-    gfx->printf("%.1fC   ", weather.tempC);
-  }
-
-  // Contacts + nearest, top-right corner
-  gfx->setTextColor(WHITE, BLACK);
-  gfx->setCursor(830, 12);
-  gfx->printf("Contacts: %u   ", blipCount);
-  gfx->setTextColor(CYAN, BLACK);
-  gfx->setCursor(830, 40);
-  if (nearest.valid) gfx->printf("%-11s", nearest.callsign);
-  else gfx->print("No TGT     ");
-
-  // Range + big zoom buttons, bottom-left margin
-  gfx->setTextSize(3);
-  gfx->setTextColor(CYAN, BLACK);
-  gfx->setCursor(20, 350);
-  gfx->printf("RNG %d km   ", (int)cfg.rMax);
-
-  gfx->fillRoundRect(FRNG_BTN_X, FRNG_PLUS_Y, FRNG_BTN_W, FRNG_BTN_H, 8, DARKGREY);
-  gfx->setTextColor(WHITE, DARKGREY);
-  gfx->setCursor(FRNG_BTN_X + 85, FRNG_PLUS_Y + 25);
-  gfx->print("+");
-
-  gfx->fillRoundRect(FRNG_BTN_X, FRNG_MINUS_Y, FRNG_BTN_W, FRNG_BTN_H, 8, DARKGREY);
-  gfx->setCursor(FRNG_BTN_X + 85, FRNG_MINUS_Y + 25);
-  gfx->print("-");
-}
-
 
 void screenWeatherSystem() {
   drawHeader("WEATHER & SYSTEM");
@@ -1158,9 +1185,14 @@ void displaySetup() {
   });
 
   initRGBPanel();
-  gfx->setBuffer(panelFbs[drawBufIdx]);  // inject BEFORE begin() so begin() skips its own allocation
-  if (!gfx->begin()) {
+  directGfx->setBuffer(panelFbs[drawBufIdx]);  // inject BEFORE begin() so begin() skips its own allocation
+  if (!directGfx->begin()) {
     Serial.println("[lcd7b] Failed to initialize display!");
+  }
+  // Staging canvas for the sliced radar redraw (own 1.2MB PSRAM buffer).
+  stagingCanvas = new Arduino_Canvas(LCD_W, LCD_H, nullptr);
+  if (!stagingCanvas->begin()) {
+    Serial.println("[lcd7b] Failed to allocate staging canvas!");
   }
   gfx->fillScreen(BLACK);
   gfx->setCursor(20, 100);
@@ -1196,27 +1228,123 @@ void applyBrightness(uint8_t percent) {
   ioExpander.setBacklight(percent);
 }
 
-// Radar screen only: full clear+redraw of the whole canvas (rings/compass/
-// blips/labels/left column) only periodically, when content can actually have
-// changed; the sweep line gets its own much faster update in between — erase
-// old position, draw new position, present. With zero-copy present, the
-// fast tick needs NO dirty-region crop/copy at all (the old pushPartial()
-// existed only to avoid a 1.2MB full-canvas copy per tick; a present is now
-// an O(1) buffer-index flip, so the whole pushPartial/crop-buffer machinery
-// is gone). The tick is gated by waitFrameDone() inside pushFrame(), so it
-// naturally runs at the panel's physical refresh rate — the fastest the
-// panel can ever show.
+// --- Staged (scheduled) radar redraw -------------------------------------
+// A monolithic full redraw costs ~200-300ms (fillScreen ~74ms + trails/
+// blips ~60-230ms + present + a 1.2MB back-buffer sync) and used to run as
+// one blocking burst every radarRedrawMs — the sweep visibly froze twice a
+// second and read as "tearing". Instead, the next frame is rendered into a
+// third PSRAM buffer (stagingCanvas) in small slices in the gaps between
+// sweep ticks, band-copied into the inactive panel fb, swapped in with ONE
+// atomic present, then mirrored into the other fb in 4 more band slices.
+// The sweep animates continuously throughout: between cycles it uses the
+// usual zero-copy flip; during a staged cycle it is drawn directly into the
+// ACTIVE fb (a 1px-line write mid-scan is invisible in practice).
 //
 // Sweep erase position is tracked PER FRAMEBUFFER (prevSweepX/Y[2]): the two
-// driver buffers alternate on every present, so the buffer a fast tick draws
-// into contains the sweep line as of two ticks ago — each buffer must
-// remember where ITS OWN line was, or the erase misses and ghosts.
+// driver buffers alternate on every present, so each buffer must remember
+// where ITS OWN line was, or the erase misses and ghosts.
+enum StageSlice : uint8_t {
+  SL_IDLE = 0,
+  SL_FILL_A, SL_FILL_B, SL_STATIC, SL_TRAILS_A, SL_TRAILS_B, SL_BLIPS,
+  SL_COPY_A, SL_COPY_B, SL_COPY_C, SL_COPY_D,
+  SL_SWAP,
+  SL_SYNC_A, SL_SYNC_B, SL_SYNC_C, SL_SYNC_D,
+};
+static StageSlice slice = SL_IDLE;
+static uint32_t lastFullCycle = 0;
+static int prevSweepX[2] = { RADAR_CX, RADAR_CX };
+static int prevSweepY[2] = { RADAR_CY - RADAR_R, RADAR_CY - RADAR_R };
+static bool havePrevSweep[2] = { false, false };
+
+// Executes exactly one slice of the staged redraw and advances the state
+// machine. Called only when no sweep tick is due, so the sweep never waits
+// on content rendering.
+void runStagingSlice(const RadarLayout &L) {
+  const int bandH = LCD_H / 4;
+  const size_t bandBytes = (size_t)bandH * LCD_W * sizeof(uint16_t);
+  switch (slice) {
+    case SL_FILL_A:
+      stagingCanvas->fillRect(0, 0, LCD_W, LCD_H / 2, BLACK);
+      slice = SL_FILL_B;
+      break;
+    case SL_FILL_B:
+      stagingCanvas->fillRect(0, LCD_H / 2, LCD_W, LCD_H - LCD_H / 2, BLACK);
+      slice = SL_STATIC;
+      break;
+    case SL_STATIC: {
+      RadarCfg cfg = radarCfgSnapshot();
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+      drawRadarFurniture(L, cfg);
+      drawRadarStatic(L, cfg);  // samples trails, records drawnSweepX/Y
+      if (dataMutex) xSemaphoreGive(dataMutex);
+      slice = SL_TRAILS_A;
+      break;
+    }
+    case SL_TRAILS_A:
+    case SL_TRAILS_B: {
+      RadarCfg cfg = radarCfgSnapshot();
+      uint8_t from = (slice == SL_TRAILS_A) ? 0 : TRAIL_SLOTS / 2;
+      uint8_t to = (slice == SL_TRAILS_A) ? TRAIL_SLOTS / 2 : TRAIL_SLOTS;
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+      drawRadarTrails(L, cfg, from, to);
+      if (dataMutex) xSemaphoreGive(dataMutex);
+      slice = (slice == SL_TRAILS_A) ? SL_TRAILS_B : SL_BLIPS;
+      break;
+    }
+    case SL_BLIPS: {
+      RadarCfg cfg = radarCfgSnapshot();
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+      drawRadarBlips(L, cfg);
+      if (dataMutex) xSemaphoreGive(dataMutex);
+      gfx = directGfx;
+      slice = SL_COPY_A;
+      break;
+    }
+    case SL_COPY_A: case SL_COPY_B: case SL_COPY_C: case SL_COPY_D: {
+      // staging -> inactive fb, one band per slice. drawBufIdx's fb is free:
+      // the last present's waitFrameDone() guaranteed it, and nothing
+      // presents during the copy phase.
+      int band = slice - SL_COPY_A;
+      memcpy((uint8_t *)panelFbs[drawBufIdx] + (size_t)band * bandBytes,
+             (uint8_t *)stagingCanvas->getFramebuffer() + (size_t)band * bandBytes,
+             bandBytes);
+      slice = (band == 3) ? SL_SWAP : (StageSlice)(slice + 1);
+      break;
+    }
+    case SL_SWAP:
+      // The ONE atomic content swap of the cycle.
+      pushFrame();
+      prevSweepX[drawBufIdx ^ 1] = drawnSweepX;
+      prevSweepY[drawBufIdx ^ 1] = drawnSweepY;
+      havePrevSweep[drawBufIdx ^ 1] = true;
+      slice = SL_SYNC_A;
+      break;
+    case SL_SYNC_A: case SL_SYNC_B: case SL_SYNC_C: case SL_SYNC_D: {
+      // Mirror the staged frame into the other fb (free since SL_SWAP's
+      // waitFrameDone) so buffer flips don't alternate content.
+      int band = slice - SL_SYNC_A;
+      memcpy((uint8_t *)panelFbs[drawBufIdx] + (size_t)band * bandBytes,
+             (uint8_t *)stagingCanvas->getFramebuffer() + (size_t)band * bandBytes,
+             bandBytes);
+      if (band == 3) {
+        prevSweepX[drawBufIdx] = drawnSweepX;
+        prevSweepY[drawBufIdx] = drawnSweepY;
+        havePrevSweep[drawBufIdx] = true;
+        slice = SL_IDLE;
+        lastFullCycle = millis();
+      } else {
+        slice = (StageSlice)(slice + 1);
+      }
+      break;
+    }
+    default:
+      slice = SL_IDLE;
+      break;
+  }
+}
+
 void renderRadar(bool justEntered) {
-  static uint32_t lastFull = 0;
   static uint32_t lastSweep = 0;
-  static int prevSweepX[2] = { RADAR_CX, RADAR_CX };
-  static int prevSweepY[2] = { RADAR_CY - RADAR_R, RADAR_CY - RADAR_R };
-  static bool havePrevSweep[2] = { false, false };
   uint32_t now = millis();
 
   uint8_t cur = screen % LCD7B_NUM_SCREENS;
@@ -1228,16 +1356,18 @@ void renderRadar(bool justEntered) {
   swpSec = sweepPeriodSec; cSweepCol = colSweep; redrawMs = radarRedrawMs;
   if (configMutex) xSemaphoreGive(configMutex);
 
-  bool needFull = justEntered || (now - lastFull >= redrawMs);
-  if (needFull) {
-    lastFull = now;
+  // Screen switch: abandon any in-progress staging and do one immediate
+  // monolithic redraw, so the new screen appears at once, fully correct.
+  if (justEntered) {
+    slice = SL_IDLE;
+    gfx = directGfx;
+    directGfx->setBuffer(panelFbs[drawBufIdx]);
 
     uint32_t t0 = micros();
     gfx->fillScreen(BLACK);
     uint32_t t1 = micros();
     if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (cur == 4) screenRadarFull();
-    else screenRadar();
+    drawRadarAll(L);
     if (dataMutex) xSemaphoreGive(dataMutex);
     uint32_t t2 = micros();
 
@@ -1252,39 +1382,58 @@ void renderRadar(bool justEntered) {
     uint32_t t3 = micros();
     lastFillUs = t1 - t0; lastDrawUs = t2 - t1; lastPushUs = t3 - t2;
 
-    // Sync the OTHER framebuffer to the frame just presented. The two driver
-    // buffers alternate on screen, and between full redraws only the sweep
-    // line is updated (tracked per-buffer) — without this copy, every buffer
-    // flip visibly bounces blips/labels/clock back and forth between the
-    // states of the last two full redraws (~500ms apart). drawBufIdx has
-    // already flipped inside pushFrame(), so panelFbs[drawBufIdx] is the
-    // free buffer (waitFrameDone guaranteed it) and drawBufIdx^1 is the one
-    // just presented. Reading a buffer mid-scan is safe; writing it wouldn't
-    // be, which is why the copy direction matters.
+    // Sync the OTHER framebuffer to the frame just presented (see SL_SYNC).
     memcpy(panelFbs[drawBufIdx], panelFbs[drawBufIdx ^ 1], (size_t)LCD_W * LCD_H * sizeof(uint16_t));
     prevSweepX[drawBufIdx] = drawnSweepX;
     prevSweepY[drawBufIdx] = drawnSweepY;
     havePrevSweep[drawBufIdx] = true;
 
+    lastFullCycle = now;
     lastSweep = now;
     return;
   }
 
-  if (now - lastSweep < 30) return;
-  lastSweep = now;
+  bool tickDue = (now - lastSweep >= 30);
 
-  float sweepDeg = fmodf(millis() / (swpSec * 1000.0f / 360.0f), 360.0f);
-  double sw = deg2rad(sweepDeg);
-  int newX = L.cx + (int)(sin(sw) * L.R);
-  int newY = L.cy - (int)(cos(sw) * L.R);
+  if (slice != SL_IDLE) {
+    // Staged cycle in progress: sweep keeps animating, drawn DIRECTLY into
+    // the active fb (no present — a 1px-line write mid-scan is invisible).
+    if (tickDue) {
+      lastSweep = now;
+      float sweepDeg = fmodf(millis() / (swpSec * 1000.0f / 360.0f), 360.0f);
+      double sw = deg2rad(sweepDeg);
+      int newX = L.cx + (int)(sin(sw) * L.R);
+      int newY = L.cy - (int)(cos(sw) * L.R);
+      uint8_t act = drawBufIdx ^ 1;
+      directGfx->setBuffer(panelFbs[act]);
+      if (havePrevSweep[act]) directGfx->drawLine(L.cx, L.cy, prevSweepX[act], prevSweepY[act], BLACK);
+      directGfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
+      prevSweepX[act] = newX; prevSweepY[act] = newY; havePrevSweep[act] = true;
+      return;
+    }
+    runStagingSlice(L);
+    return;
+  }
 
-  if (havePrevSweep[drawBufIdx]) gfx->drawLine(L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx], BLACK);
-  gfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
-  prevSweepX[drawBufIdx] = newX;
-  prevSweepY[drawBufIdx] = newY;
-  havePrevSweep[drawBufIdx] = true;
-
-  pushFrame();
+  // Idle between cycles: zero-copy sweep tick (erase+draw in the inactive
+  // fb, then an O(1) present), or kick off a new staged cycle.
+  if (tickDue) {
+    lastSweep = now;
+    float sweepDeg = fmodf(millis() / (swpSec * 1000.0f / 360.0f), 360.0f);
+    double sw = deg2rad(sweepDeg);
+    int newX = L.cx + (int)(sin(sw) * L.R);
+    int newY = L.cy - (int)(cos(sw) * L.R);
+    directGfx->setBuffer(panelFbs[drawBufIdx]);
+    if (havePrevSweep[drawBufIdx]) gfx->drawLine(L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx], BLACK);
+    gfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
+    prevSweepX[drawBufIdx] = newX; prevSweepY[drawBufIdx] = newY; havePrevSweep[drawBufIdx] = true;
+    pushFrame();
+    return;
+  }
+  if (now - lastFullCycle >= redrawMs) {
+    gfx = stagingCanvas;
+    slice = SL_FILL_A;
+  }
 }
 
 void render() {
@@ -1303,6 +1452,13 @@ void render() {
     renderRadar(justEntered);
     return;
   }
+
+  // Abandon any staged radar redraw interrupted by the screen switch, and
+  // restore the global render target to a panel fb (staging slices retarget
+  // gfx to the staging canvas).
+  slice = SL_IDLE;
+  gfx = directGfx;
+  directGfx->setBuffer(panelFbs[drawBufIdx]);
 
   static uint32_t lastDraw = 0;
   uint32_t now = millis();
