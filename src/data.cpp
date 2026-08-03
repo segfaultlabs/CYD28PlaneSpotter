@@ -33,6 +33,30 @@ bool   showType = false;
 bool   showTraces = false;
 bool   preferLocalTables = true;
 
+// Extended radar/display configuration — defaults match the previously
+// hardcoded constants, so a fresh NVS behaves exactly like before.
+// Colors are RGB565 (web UI converts to/from #rrggbb).
+uint8_t  maxBlipsShown = MAX_BLIPS;
+uint16_t trailMaxSamples = 1800;
+uint16_t trailStaleSec = 15;
+float    classNearKm = 25.0f;
+uint16_t classMaxAltFt = 12000;
+int16_t  classVrateFpm = 250;
+float    sweepPeriodSec = 5.4f;
+uint16_t radarRedrawMs = 500;
+uint16_t fetchIntervalSec = UPDATE_INTERVAL_MS / 1000;
+bool     showAirports = true;
+bool     showTrailKey = true;
+bool     showCompass = true;
+uint16_t colSweep = 0x07E0;      // GREEN
+uint16_t colBlip = 0x07E0;       // GREEN
+uint16_t colBlipHi = 0xFFE0;     // YELLOW
+uint16_t colRings = 0x4208;      // DARKGREY
+uint16_t colAirport = 0xF81F;    // MAGENTA
+uint16_t colTrailDep = 0x07FF;   // CYAN
+uint16_t colTrailArr = 0xFD20;   // ORANGE
+uint16_t colTrailOver = 0xFFE0;  // YELLOW
+
 SemaphoreHandle_t configMutex = NULL;
 WebServer server(80);
 Preferences prefs;
@@ -289,8 +313,13 @@ void dataFetcherTask(void* param) {
   locNearest.valid = false;
 
   for (;;) {
-    // Wait for the next poll interval (sleep in 1s chunks so task is responsive)
-    for (int t = 0; t < UPDATE_INTERVAL_MS / 1000; t++) {
+    // Wait for the next poll interval (sleep in 1s chunks so task is responsive).
+    // Interval is runtime-configurable via the web UI (fetchIntervalSec).
+    uint16_t intervalSec;
+    if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+    intervalSec = fetchIntervalSec;
+    if (configMutex) xSemaphoreGive(configMutex);
+    for (uint16_t t = 0; t < intervalSec; t++) {
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -590,16 +619,41 @@ static const int AIRPORT_CODES_ICAO_IATA_COUNT = sizeof(AIRPORT_CODES_ICAO_IATA)
 // ---------------------------------------------------------------------------
 // Web Server — Config Page
 // ---------------------------------------------------------------------------
+// #rrggbb <-> RGB565 conversion for the config page's color inputs.
+static uint16_t hexToRgb565(const String& hex) {
+  const char* s = hex.c_str();
+  if (s[0] == '#') s++;
+  long v = strtol(s, NULL, 16);
+  uint8_t r = (v >> 16) & 0xFF, g = (v >> 8) & 0xFF, b = v & 0xFF;
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+static String rgb565ToHex(uint16_t c) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "#%02x%02x%02x",
+           (c >> 8) & 0xF8, (c >> 3) & 0xFC, (c << 3) & 0xF8);
+  return String(buf);
+}
+
 void initWebServer() {
   // GET / — serve config page
   server.on("/", []() {
     // Snapshot current values
     double hLat, hLon; float rMax; bool inv; uint8_t bright;
     bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy, showTr, preferTables;
+    uint8_t maxB; uint16_t trailSamp, trailStale, cAlt, redrawMs, fetchSec;
+    float swpSec, cNear; int16_t cVr;
+    bool sApt, sKey, sComp;
+    uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors; bright = brightness;
     showCS = showCallsign; showAir = showAirline; showSpd = showSpeed; showFlt = showFL; showRte = showRoute;
     showRg = showReg; showSq = showSquawk; showVr = showVRate; showTy = showType; showTr = showTraces; preferTables = preferLocalTables;
+    maxB = maxBlipsShown; trailSamp = trailMaxSamples; trailStale = trailStaleSec;
+    cNear = classNearKm; cAlt = classMaxAltFt; cVr = classVrateFpm;
+    swpSec = sweepPeriodSec; redrawMs = radarRedrawMs; fetchSec = fetchIntervalSec;
+    sApt = showAirports; sKey = showTrailKey; sComp = showCompass;
+    cSweep = colSweep; cBlip = colBlip; cBlipHi = colBlipHi; cRings = colRings; cAirpt = colAirport;
+    cTrDep = colTrailDep; cTrArr = colTrailArr; cTrOver = colTrailOver;
     if (configMutex) xSemaphoreGive(configMutex);
 
     String html = R"rawliteral(
@@ -627,6 +681,10 @@ void initWebServer() {
   input:checked + .slider:before{transform:translateX(22px)}
   .section-hd{color:#888;font-size:0.75em;text-transform:uppercase;letter-spacing:0.05em;margin:18px 0 4px;border-top:1px solid #333;padding-top:14px}
   input[type=range]{width:100%;padding:0;accent-color:#00ff88}
+  input[type=color]{width:64px;height:34px;padding:2px;vertical-align:middle}
+  .color-row{display:flex;align-items:center;justify-content:space-between;margin:8px 0}
+  .color-row label{margin:0;color:#e0e0e0;font-size:0.95em}
+  .note{color:#666;font-size:0.75em;margin:2px 0 6px}
 </style></head><body>
 <h1>&#9992; CYD Plane Spotter</h1>
 <div class="card">
@@ -724,6 +782,58 @@ void initWebServer() {
         <span class="slider"></span>
       </label>
     </div>
+    <div class="section-hd">Radar Display</div>
+    <div class="note">Currently applied by the LCD-7B v2 display engine only.</div>
+    <label>Max planes shown at once (1-20)</label>
+    <input type="number" name="maxblips" id="maxblips" min="1" max="20" value=")rawliteral" + String(maxB) + R"rawliteral(">
+    <label>Sweep revolution period (seconds)</label>
+    <input type="number" step="0.1" name="swpsec" id="swpsec" min="1" max="60" value=")rawliteral" + String(swpSec, 1) + R"rawliteral(">
+    <label>Full screen refresh interval (ms)</label>
+    <input type="number" step="50" name="redrawms" id="redrawms" min="200" max="5000" value=")rawliteral" + String(redrawMs) + R"rawliteral(">
+    <div class="color-row"><label>Sweep line</label><input type="color" name="c_sweep" id="c_sweep" value=")rawliteral" + rgb565ToHex(cSweep) + R"rawliteral("></div>
+    <div class="color-row"><label>Plane (after sweep passes)</label><input type="color" name="c_blip" id="c_blip" value=")rawliteral" + rgb565ToHex(cBlip) + R"rawliteral("></div>
+    <div class="color-row"><label>Plane (just behind sweep)</label><input type="color" name="c_bliphi" id="c_bliphi" value=")rawliteral" + rgb565ToHex(cBlipHi) + R"rawliteral("></div>
+    <div class="color-row"><label>Range rings &amp; axes</label><input type="color" name="c_rings" id="c_rings" value=")rawliteral" + rgb565ToHex(cRings) + R"rawliteral("></div>
+    <div class="color-row"><label>Airports</label><input type="color" name="c_airpt" id="c_airpt" value=")rawliteral" + rgb565ToHex(cAirpt) + R"rawliteral("></div>
+    <div class="switch-row">
+      <label for="showapt">Show airports on radar</label>
+      <label class="switch">
+        <input type="checkbox" id="showapt")rawliteral" + String(sApt ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="showcomp">Show compass letters (N/E/S/W)</label>
+      <label class="switch">
+        <input type="checkbox" id="showcomp")rawliteral" + String(sComp ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row">
+      <label for="showkey">Show trace color key</label>
+      <label class="switch">
+        <input type="checkbox" id="showkey")rawliteral" + String(sKey ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="section-hd">Flight Path Traces</div>
+    <div class="color-row"><label>Taking off</label><input type="color" name="c_trdep" id="c_trdep" value=")rawliteral" + rgb565ToHex(cTrDep) + R"rawliteral("></div>
+    <div class="color-row"><label>Landing</label><input type="color" name="c_trarr" id="c_trarr" value=")rawliteral" + rgb565ToHex(cTrArr) + R"rawliteral("></div>
+    <div class="color-row"><label>Flying over</label><input type="color" name="c_trover" id="c_trover" value=")rawliteral" + rgb565ToHex(cTrOver) + R"rawliteral("></div>
+    <label>Max trail length (samples, 50-1800)</label>
+    <input type="number" step="50" name="trailsamp" id="trailsamp" min="50" max="1800" value=")rawliteral" + String(trailSamp) + R"rawliteral(">
+    <label>Drop trail after seconds unseen (5-300)</label>
+    <input type="number" name="trailstale" id="trailstale" min="5" max="300" value=")rawliteral" + String(trailStale) + R"rawliteral(">
+    <div class="section-hd">Takeoff / Landing Classification</div>
+    <label>Near-airport distance (km)</label>
+    <input type="number" step="0.5" name="cnearkm" id="cnearkm" min="1" max="200" value=")rawliteral" + String(cNear, 1) + R"rawliteral(">
+    <label>Max altitude (ft)</label>
+    <input type="number" step="500" name="cmaxalt" id="cmaxalt" min="500" max="45000" value=")rawliteral" + String(cAlt) + R"rawliteral(">
+    <label>Min vertical rate (fpm)</label>
+    <input type="number" step="50" name="cvrate" id="cvrate" min="50" max="3000" value=")rawliteral" + String(cVr) + R"rawliteral(">
+    <div class="section-hd">Data Fetch</div>
+    <label>Aircraft poll interval (seconds, 5-600)</label>
+    <input type="number" name="fetchsec" id="fetchsec" min="5" max="600" value=")rawliteral" + String(fetchSec) + R"rawliteral(">
     <button type="submit">Save Settings</button>
   </form>
   <div class="saved" id="msg">&#10003; Settings saved!</div>
@@ -762,7 +872,27 @@ function save(e){
          '&vrate='+(document.getElementById('vrate').checked?'1':'0')+
          '&type='+(document.getElementById('type').checked?'1':'0')+
          '&traces='+(document.getElementById('traces').checked?'1':'0')+
-         '&tables='+(document.getElementById('tables').checked?'1':'0'));
+         '&tables='+(document.getElementById('tables').checked?'1':'0')+
+         '&maxblips='+encodeURIComponent(document.getElementById('maxblips').value)+
+         '&swpsec='+encodeURIComponent(document.getElementById('swpsec').value)+
+         '&redrawms='+encodeURIComponent(document.getElementById('redrawms').value)+
+         '&fetchsec='+encodeURIComponent(document.getElementById('fetchsec').value)+
+         '&trailsamp='+encodeURIComponent(document.getElementById('trailsamp').value)+
+         '&trailstale='+encodeURIComponent(document.getElementById('trailstale').value)+
+         '&cnearkm='+encodeURIComponent(document.getElementById('cnearkm').value)+
+         '&cmaxalt='+encodeURIComponent(document.getElementById('cmaxalt').value)+
+         '&cvrate='+encodeURIComponent(document.getElementById('cvrate').value)+
+         '&c_sweep='+encodeURIComponent(document.getElementById('c_sweep').value)+
+         '&c_blip='+encodeURIComponent(document.getElementById('c_blip').value)+
+         '&c_bliphi='+encodeURIComponent(document.getElementById('c_bliphi').value)+
+         '&c_rings='+encodeURIComponent(document.getElementById('c_rings').value)+
+         '&c_airpt='+encodeURIComponent(document.getElementById('c_airpt').value)+
+         '&c_trdep='+encodeURIComponent(document.getElementById('c_trdep').value)+
+         '&c_trarr='+encodeURIComponent(document.getElementById('c_trarr').value)+
+         '&c_trover='+encodeURIComponent(document.getElementById('c_trover').value)+
+         '&showapt='+(document.getElementById('showapt').checked?'1':'0')+
+         '&showcomp='+(document.getElementById('showcomp').checked?'1':'0')+
+         '&showkey='+(document.getElementById('showkey').checked?'1':'0'));
 }
 function doOta(e){
   e.preventDefault();
@@ -812,6 +942,28 @@ function doOta(e){
     bool   newShowTraces = server.hasArg("traces") ? (server.arg("traces") == "1") : showTraces;
     bool   newPreferTables = server.hasArg("tables") ? (server.arg("tables") == "1") : preferLocalTables;
 
+    // Extended radar/display settings (all optional — absent args keep current)
+    uint8_t  newMaxBlips = server.hasArg("maxblips") ? (uint8_t)server.arg("maxblips").toInt() : maxBlipsShown;
+    float    newSwpSec = server.hasArg("swpsec") ? server.arg("swpsec").toFloat() : sweepPeriodSec;
+    uint16_t newRedrawMs = server.hasArg("redrawms") ? (uint16_t)server.arg("redrawms").toInt() : radarRedrawMs;
+    uint16_t newFetchSec = server.hasArg("fetchsec") ? (uint16_t)server.arg("fetchsec").toInt() : fetchIntervalSec;
+    uint16_t newTrailSamp = server.hasArg("trailsamp") ? (uint16_t)server.arg("trailsamp").toInt() : trailMaxSamples;
+    uint16_t newTrailStale = server.hasArg("trailstale") ? (uint16_t)server.arg("trailstale").toInt() : trailStaleSec;
+    float    newCNear = server.hasArg("cnearkm") ? server.arg("cnearkm").toFloat() : classNearKm;
+    uint16_t newCAlt = server.hasArg("cmaxalt") ? (uint16_t)server.arg("cmaxalt").toInt() : classMaxAltFt;
+    int16_t  newCVr = server.hasArg("cvrate") ? (int16_t)server.arg("cvrate").toInt() : classVrateFpm;
+    bool     newShowApt = server.hasArg("showapt") ? (server.arg("showapt") == "1") : showAirports;
+    bool     newShowKey = server.hasArg("showkey") ? (server.arg("showkey") == "1") : showTrailKey;
+    bool     newShowComp = server.hasArg("showcomp") ? (server.arg("showcomp") == "1") : showCompass;
+    uint16_t newColSweep = server.hasArg("c_sweep") ? hexToRgb565(server.arg("c_sweep")) : colSweep;
+    uint16_t newColBlip = server.hasArg("c_blip") ? hexToRgb565(server.arg("c_blip")) : colBlip;
+    uint16_t newColBlipHi = server.hasArg("c_bliphi") ? hexToRgb565(server.arg("c_bliphi")) : colBlipHi;
+    uint16_t newColRings = server.hasArg("c_rings") ? hexToRgb565(server.arg("c_rings")) : colRings;
+    uint16_t newColAirpt = server.hasArg("c_airpt") ? hexToRgb565(server.arg("c_airpt")) : colAirport;
+    uint16_t newColTrDep = server.hasArg("c_trdep") ? hexToRgb565(server.arg("c_trdep")) : colTrailDep;
+    uint16_t newColTrArr = server.hasArg("c_trarr") ? hexToRgb565(server.arg("c_trarr")) : colTrailArr;
+    uint16_t newColTrOver = server.hasArg("c_trover") ? hexToRgb565(server.arg("c_trover")) : colTrailOver;
+
     // Basic validation
     if (newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180 ||
         newRng <= 0 || newRng > 500) {
@@ -820,6 +972,25 @@ function doOta(e){
     }
     if (newBrightness < 1) newBrightness = 1;
     if (newBrightness > 100) newBrightness = 100;
+    // Clamp the extended settings to sane ranges
+    if (newMaxBlips < 1) newMaxBlips = 1;
+    if (newMaxBlips > MAX_BLIPS) newMaxBlips = MAX_BLIPS;
+    if (newSwpSec < 1.0f) newSwpSec = 1.0f;
+    if (newSwpSec > 60.0f) newSwpSec = 60.0f;
+    if (newRedrawMs < 200) newRedrawMs = 200;
+    if (newRedrawMs > 5000) newRedrawMs = 5000;
+    if (newFetchSec < 5) newFetchSec = 5;
+    if (newFetchSec > 600) newFetchSec = 600;
+    if (newTrailSamp < 50) newTrailSamp = 50;
+    if (newTrailSamp > 1800) newTrailSamp = 1800;
+    if (newTrailStale < 5) newTrailStale = 5;
+    if (newTrailStale > 300) newTrailStale = 300;
+    if (newCNear < 1.0f) newCNear = 1.0f;
+    if (newCNear > 200.0f) newCNear = 200.0f;
+    if (newCAlt < 500) newCAlt = 500;
+    if (newCAlt > 45000) newCAlt = 45000;
+    if (newCVr < 50) newCVr = 50;
+    if (newCVr > 3000) newCVr = 3000;
 
     // Atomically update
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
@@ -839,6 +1010,26 @@ function doOta(e){
     showType = newShowType;
     showTraces = newShowTraces;
     preferLocalTables = newPreferTables;
+    maxBlipsShown = newMaxBlips;
+    sweepPeriodSec = newSwpSec;
+    radarRedrawMs = newRedrawMs;
+    fetchIntervalSec = newFetchSec;
+    trailMaxSamples = newTrailSamp;
+    trailStaleSec = newTrailStale;
+    classNearKm = newCNear;
+    classMaxAltFt = newCAlt;
+    classVrateFpm = newCVr;
+    showAirports = newShowApt;
+    showTrailKey = newShowKey;
+    showCompass = newShowComp;
+    colSweep = newColSweep;
+    colBlip = newColBlip;
+    colBlipHi = newColBlipHi;
+    colRings = newColRings;
+    colAirport = newColAirpt;
+    colTrailDep = newColTrDep;
+    colTrailArr = newColTrArr;
+    colTrailOver = newColTrOver;
     if (configMutex) xSemaphoreGive(configMutex);
     applyInvertColors(newInvert);
     applyBrightness(newBrightness);
@@ -860,6 +1051,26 @@ function doOta(e){
     prefs.putBool("type", newShowType);
     prefs.putBool("traces", newShowTraces);
     prefs.putBool("tables", newPreferTables);
+    prefs.putUChar("maxblips", newMaxBlips);
+    prefs.putFloat("swpsec", newSwpSec);
+    prefs.putUShort("redrawms", newRedrawMs);
+    prefs.putUShort("fetchsec", newFetchSec);
+    prefs.putUShort("trailsamp", newTrailSamp);
+    prefs.putUShort("trailstale", newTrailStale);
+    prefs.putFloat("cnearkm", newCNear);
+    prefs.putUShort("cmaxalt", newCAlt);
+    prefs.putShort("cvrate", newCVr);
+    prefs.putBool("showapt", newShowApt);
+    prefs.putBool("showkey", newShowKey);
+    prefs.putBool("showcomp", newShowComp);
+    prefs.putUShort("c_sweep", newColSweep);
+    prefs.putUShort("c_blip", newColBlip);
+    prefs.putUShort("c_bliphi", newColBlipHi);
+    prefs.putUShort("c_rings", newColRings);
+    prefs.putUShort("c_airpt", newColAirpt);
+    prefs.putUShort("c_trdep", newColTrDep);
+    prefs.putUShort("c_trarr", newColTrArr);
+    prefs.putUShort("c_trover", newColTrOver);
 
     Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,

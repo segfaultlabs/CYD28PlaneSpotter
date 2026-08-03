@@ -180,18 +180,15 @@ static const uint8_t AIRPORT_COUNT = sizeof(AIRPORTS) / sizeof(AIRPORTS[0]);
 // airport + significant vertical rate. Kept simple on purpose: adsb.lol
 // gives no flight-plan phase, and route lookups are only opportunistically
 // cached, so vertical-rate-vs-airport-proximity is the most consistent
-// signal available on every blip.
+// signal available on every blip. Thresholds are runtime-configurable via
+// the web UI (classNearKm / classMaxAltFt / classVrateFpm).
 enum TrailClass : uint8_t { TC_OVER = 0, TC_DEP, TC_ARR };
-#define CLASS_NEAR_AIRPORT_KM 25.0
-#define CLASS_MAX_ALT_FT 12000.0f
-#define CLASS_VRATE_FPM 250
-static const uint16_t TRAIL_COLORS[3] = { YELLOW, CYAN, ORANGE };  // TC_OVER, TC_DEP, TC_ARR
-static TrailClass classifyBlip(const Blip &b) {
-  if (b.altitudeM * 3.28084f >= CLASS_MAX_ALT_FT) return TC_OVER;
+static TrailClass classifyBlip(const Blip &b, float nearKm, uint16_t maxAltFt, int16_t vrateFpm) {
+  if (b.altitudeM * 3.28084f >= (float)maxAltFt) return TC_OVER;
   for (uint8_t a = 0; a < AIRPORT_COUNT; a++) {
-    if (haversineKm(b.lat, b.lon, AIRPORTS[a].lat, AIRPORTS[a].lon) <= CLASS_NEAR_AIRPORT_KM) {
-      if (b.vrateFpm > CLASS_VRATE_FPM) return TC_DEP;
-      if (b.vrateFpm < -CLASS_VRATE_FPM) return TC_ARR;
+    if (haversineKm(b.lat, b.lon, AIRPORTS[a].lat, AIRPORTS[a].lon) <= (double)nearKm) {
+      if (b.vrateFpm > vrateFpm) return TC_DEP;
+      if (b.vrateFpm < -vrateFpm) return TC_ARR;
       return TC_OVER;
     }
   }
@@ -201,6 +198,23 @@ static const Blip *findBlipByCallsign(const char *callsign) {
   for (uint8_t i = 0; i < blipCount; i++)
     if (strcmp(blips[i].callsign, callsign) == 0) return &blips[i];
   return nullptr;
+}
+
+// Float-precision polar projection for the trail rendering loop. Double-
+// precision trig is software-emulated on the ESP32-S3 (~20-50us per call),
+// and projecting 1800 samples x several trails with the double haversineKm/
+// bearingDeg helpers on every full redraw cost 450-850ms per frame (measured
+// via /timingdebug — it looked like a panel problem but was CPU). Float trig
+// is ~10-20x faster and accurate to ~1m at radar scale — sub-pixel.
+static inline void trailPolar(float lat1, float lon1, float lat2, float lon2, float &distKm, float &brgDeg) {
+  const float D2R = (float)PI / 180.0f;
+  float dLat = (lat2 - lat1) * D2R, dLon = (lon2 - lon1) * D2R;
+  float s1 = sinf(dLat * 0.5f), s2 = sinf(dLon * 0.5f);
+  float a = s1 * s1 + cosf(lat1 * D2R) * cosf(lat2 * D2R) * s2 * s2;
+  distKm = 6371.0f * 2.0f * atan2f(sqrtf(a), sqrtf(1.0f - a));
+  float y = sinf(dLon) * cosf(lat2 * D2R);
+  float x = cosf(lat1 * D2R) * sinf(lat2 * D2R) - sinf(lat1 * D2R) * cosf(lat2 * D2R) * cosf(dLon);
+  brgDeg = fmodf(atan2f(y, x) / D2R + 360.0f, 360.0f);
 }
 
 // Real double-buffered RGB panel, bypassing Arduino_GFX's RGB bus classes
@@ -391,14 +405,13 @@ static volatile uint32_t lastFillUs = 0, lastDrawUs = 0, lastPushUs = 0, lastFra
 // 1800 samples ~= 15-30 min of history at this screen's 1-2Hz full-redraw
 // sampling rate -- long enough that no realistic single viewing session
 // should ever see a trail age out by hitting this cap; only true staleness
-// (TRAIL_STALE_MS, aircraft actually gone) should ever clear a trail. Backed
+// (the trailStaleSec config, aircraft actually gone) should ever clear a trail. Backed
 // by PSRAM (ps_malloc, lazily allocated per slot and kept for the life of
 // the program) rather than a fixed struct member -- 1800*16 bytes*20 slots
 // is ~560KB, too big to want living in internal SRAM/.bss alongside
 // everything else, but trivial against this board's 8MB PSRAM.
 #define TRAIL_LEN 1800
 #define TRAIL_SLOTS MAX_BLIPS
-#define TRAIL_STALE_MS 15000  // drop a trail if its aircraft hasn't been seen in this long
 struct TrailHistory {
   char callsign[10] = {0};
   double *lat = nullptr, *lon = nullptr;  // ps_malloc'd on first use, kept across resets
@@ -522,8 +535,9 @@ void drawWeatherIcon(int x, int y, int code) {
   }
 }
 
-// Diamond marker for airports — distinct shape AND color (MAGENTA) so it
-// can't be confused with blips, traces, rings, or the sweep.
+// Diamond marker for airports — distinct shape AND color (configurable,
+// MAGENTA by default) so it can't be confused with blips, traces, rings,
+// or the sweep.
 static void drawAirportMarker(int px, int py, uint16_t color) {
   gfx->drawLine(px, py - 6, px + 6, py, color);
   gfx->drawLine(px + 6, py, px, py + 6, color);
@@ -533,14 +547,14 @@ static void drawAirportMarker(int px, int py, uint16_t color) {
 
 // On-screen key explaining the trace classification colors + airport
 // marker. Drawn only when showTraces is on (no traces, nothing to explain).
-static void drawTrailKey(int x, int y) {
+static void drawTrailKey(int x, int y, uint16_t cDep, uint16_t cArr, uint16_t cOver, uint16_t cApt) {
   const char *labels[4] = { "TAKEOFF", "LANDING", "FLYOVER", "AIRPORT" };
+  const uint16_t colors[4] = { cDep, cArr, cOver, cApt };
   gfx->setTextSize(2);
   for (uint8_t i = 0; i < 4; i++) {
-    uint16_t c = (i < 3) ? TRAIL_COLORS[i] : MAGENTA;
-    if (i == 3) drawAirportMarker(x + 10, y + 8, MAGENTA);
-    else gfx->drawFastHLine(x, y + 8, 20, c);
-    gfx->setTextColor(c, BLACK);
+    if (i == 3) drawAirportMarker(x + 10, y + 8, colors[i]);
+    else gfx->drawFastHLine(x, y + 8, 20, colors[i]);
+    gfx->setTextColor(colors[i], BLACK);
     gfx->setCursor(x + 30, y);
     gfx->print(labels[i]);
     y += 32;
@@ -718,6 +732,10 @@ static int drawnSweepX = RADAR_CX, drawnSweepY = RADAR_CY - RADAR_R;
 struct RadarCfg {
   double hLat, hLon; float rMax;
   bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
+  uint8_t maxBlips; uint16_t trailSamp, trailStale, cAlt, redrawMs;
+  float swpSec, cNear; int16_t cVr;
+  bool sApt, sKey, sComp;
+  uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
 };
 static RadarCfg radarCfgSnapshot() {
   RadarCfg c;
@@ -725,6 +743,12 @@ static RadarCfg radarCfgSnapshot() {
   c.hLat = homeLat; c.hLon = homeLon; c.rMax = radarMaxKm;
   c.showCS = showCallsign; c.showAir = showAirline; c.showSpd = showSpeed; c.showFlt = showFL; c.showRte = showRoute;
   c.showRg = showReg; c.showSq = showSquawk; c.showVr = showVRate; c.showTy = showType;
+  c.maxBlips = maxBlipsShown; c.trailSamp = trailMaxSamples; c.trailStale = trailStaleSec;
+  c.cNear = classNearKm; c.cAlt = classMaxAltFt; c.cVr = classVrateFpm;
+  c.swpSec = sweepPeriodSec; c.redrawMs = radarRedrawMs;
+  c.sApt = showAirports; c.sKey = showTrailKey; c.sComp = showCompass;
+  c.cSweep = colSweep; c.cBlip = colBlip; c.cBlipHi = colBlipHi; c.cRings = colRings; c.cAirpt = colAirport;
+  c.cTrDep = colTrailDep; c.cTrArr = colTrailArr; c.cTrOver = colTrailOver;
   if (configMutex) xSemaphoreGive(configMutex);
   return c;
 }
@@ -795,14 +819,14 @@ void drawRadarCommon(const RadarLayout &L) {
   RadarCfg cfg = radarCfgSnapshot();
   const int cx = L.cx, cy = L.cy, R = L.R;
   uint32_t nowMs = millis();
-  float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
+  float sweepDeg = fmodf(millis() / (cfg.swpSec * 1000.0f / 360.0f), 360.0f);
   double sw = deg2rad(sweepDeg);
 
-  gfx->drawCircle(cx, cy, R, DARKGREY);
-  gfx->drawCircle(cx, cy, R * 2 / 3, DARKGREY);
-  gfx->drawCircle(cx, cy, R / 3, DARKGREY);
-  gfx->drawLine(cx - R, cy, cx + R, cy, DARKGREY);
-  gfx->drawLine(cx, cy - R, cx, cy + R, DARKGREY);
+  gfx->drawCircle(cx, cy, R, cfg.cRings);
+  gfx->drawCircle(cx, cy, R * 2 / 3, cfg.cRings);
+  gfx->drawCircle(cx, cy, R / 3, cfg.cRings);
+  gfx->drawLine(cx - R, cy, cx + R, cy, cfg.cRings);
+  gfx->drawLine(cx, cy - R, cx, cy + R, cfg.cRings);
 
   // Compass — matches the same north-up, clockwise convention already
   // used for blip placement (bx = cx + sin(brg)*r, by = cy - cos(brg)*r,
@@ -810,54 +834,58 @@ void drawRadarCommon(const RadarLayout &L) {
   // where blips actually land, not just decorative. Classic layout puts
   // them OUTSIDE the circle (header/column leave margin); the full-screen
   // layout's circle nearly touches the canvas edges, so they go INSIDE.
-  gfx->setTextSize(2);
-  gfx->setTextColor(LIGHTGREY, BLACK);
-  int16_t lx1, ly1; uint16_t lw, lh;
-  gfx->getTextBounds("N", 0, 0, &lx1, &ly1, &lw, &lh);
-  if (L.full) {
-    gfx->setCursor(cx - lw / 2, cy - R + 6); gfx->print("N");
-    gfx->setCursor(cx - lw / 2, cy + R - lh - 6); gfx->print("S");
-    gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
-    gfx->setCursor(cx + R - lw - 8, cy - lh / 2); gfx->print("E");
-    gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
-    gfx->setCursor(cx - R + 8, cy - lh / 2); gfx->print("W");
-  } else {
-    gfx->setCursor(cx - lw / 2, cy - R - lh - 6); gfx->print("N");
-    gfx->setCursor(cx - lw / 2, cy + R + 6); gfx->print("S");
-    gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
-    gfx->setCursor(cx + R + 8, cy - lh / 2); gfx->print("E");
-    gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
-    gfx->setCursor(cx - R - 8 - lw, cy - lh / 2); gfx->print("W");
+  if (cfg.sComp) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(LIGHTGREY, BLACK);
+    int16_t lx1, ly1; uint16_t lw, lh;
+    gfx->getTextBounds("N", 0, 0, &lx1, &ly1, &lw, &lh);
+    if (L.full) {
+      gfx->setCursor(cx - lw / 2, cy - R + 6); gfx->print("N");
+      gfx->setCursor(cx - lw / 2, cy + R - lh - 6); gfx->print("S");
+      gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
+      gfx->setCursor(cx + R - lw - 8, cy - lh / 2); gfx->print("E");
+      gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
+      gfx->setCursor(cx - R + 8, cy - lh / 2); gfx->print("W");
+    } else {
+      gfx->setCursor(cx - lw / 2, cy - R - lh - 6); gfx->print("N");
+      gfx->setCursor(cx - lw / 2, cy + R + 6); gfx->print("S");
+      gfx->getTextBounds("E", 0, 0, &lx1, &ly1, &lw, &lh);
+      gfx->setCursor(cx + R + 8, cy - lh / 2); gfx->print("E");
+      gfx->getTextBounds("W", 0, 0, &lx1, &ly1, &lw, &lh);
+      gfx->setCursor(cx - R - 8 - lw, cy - lh / 2); gfx->print("W");
+    }
   }
 
-  // --- Physical airports in range: MAGENTA diamond + IATA code ---
-  gfx->setTextColor(MAGENTA, BLACK);
-  for (uint8_t a = 0; a < AIRPORT_COUNT; a++) {
-    double dist = haversineKm(cfg.hLat, cfg.hLon, AIRPORTS[a].lat, AIRPORTS[a].lon);
-    float fr = (float)(dist / cfg.rMax);
-    if (fr > 1) continue;
-    int rr = (int)(fr * R);
-    double brg = bearingDeg(cfg.hLat, cfg.hLon, AIRPORTS[a].lat, AIRPORTS[a].lon);
-    int px = cx + (int)(sin(deg2rad(brg)) * rr);
-    int py = cy - (int)(cos(deg2rad(brg)) * rr);
-    drawAirportMarker(px, py, MAGENTA);
-    gfx->setCursor(px + 9, py - 8);
-    gfx->print(AIRPORTS[a].iata);
+  // --- Physical airports in range: diamond marker + IATA code ---
+  if (cfg.sApt) {
+    gfx->setTextColor(cfg.cAirpt, BLACK);
+    for (uint8_t a = 0; a < AIRPORT_COUNT; a++) {
+      double dist = haversineKm(cfg.hLat, cfg.hLon, AIRPORTS[a].lat, AIRPORTS[a].lon);
+      float fr = (float)(dist / cfg.rMax);
+      if (fr > 1) continue;
+      int rr = (int)(fr * R);
+      double brg = bearingDeg(cfg.hLat, cfg.hLon, AIRPORTS[a].lat, AIRPORTS[a].lon);
+      int px = cx + (int)(sin(deg2rad(brg)) * rr);
+      int py = cy - (int)(cos(deg2rad(brg)) * rr);
+      drawAirportMarker(px, py, cfg.cAirpt);
+      gfx->setCursor(px + 9, py - 8);
+      gfx->print(AIRPORTS[a].iata);
+    }
   }
 
   drawnSweepX = cx + (int)(sin(sw) * R);
   drawnSweepY = cy - (int)(cos(sw) * R);
-  gfx->drawLine(cx, cy, drawnSweepX, drawnSweepY, GREEN);
+  gfx->drawLine(cx, cy, drawnSweepX, drawnSweepY, cfg.cSweep);
 
   float elapsed = (millis() - lastDataMs) / 1000.0f;
 
   // --- Flight path traces: per-aircraft position history, keyed by
   // callsign since blips[] array indices aren't stable between fetch
   // cycles. Sampled once per render cycle. Entries not seen in
-  // TRAIL_STALE_MS are dropped, so a trail vanishes once its aircraft is
+  // trailStaleSec are dropped, so a trail vanishes once its aircraft is
   // no longer tracked (out of range / off screen). Color encodes flight
-  // phase (see classifyBlip): CYAN takeoff / ORANGE landing near an
-  // airport, YELLOW flyover — key drawn below.
+  // phase (see classifyBlip) — all three colors and the thresholds are
+  // configurable via the web UI; key drawn below.
   if (showTraces) {
     for (uint8_t i = 0; i < blipCount; i++) {
       if (!blips[i].callsign[0]) continue;
@@ -873,39 +901,52 @@ void drawRadarCommon(const RadarLayout &L) {
       }
       TrailHistory &t = trails[slot];
       t.ensureBuf();
-      if (t.count < TRAIL_LEN) {
+      // Runtime-configurable cap (trailMaxSamples), never above the
+      // compiled-in buffer size. If the cap was lowered at runtime, drop the
+      // oldest samples once to get back under it.
+      uint16_t cap = cfg.trailSamp < TRAIL_LEN ? cfg.trailSamp : TRAIL_LEN;
+      if (t.count > cap) {
+        uint16_t drop = t.count - cap;
+        memmove(t.lat, t.lat + drop, cap * sizeof(double));
+        memmove(t.lon, t.lon + drop, cap * sizeof(double));
+        t.count = cap;
+      }
+      if (t.count < cap) {
         t.lat[t.count] = blips[i].lat; t.lon[t.count] = blips[i].lon; t.count++;
       } else {
-        for (uint16_t j = 1; j < TRAIL_LEN; j++) { t.lat[j-1] = t.lat[j]; t.lon[j-1] = t.lon[j]; }
-        t.lat[TRAIL_LEN-1] = blips[i].lat; t.lon[TRAIL_LEN-1] = blips[i].lon;
+        for (uint16_t j = 1; j < cap; j++) { t.lat[j-1] = t.lat[j]; t.lon[j-1] = t.lon[j]; }
+        t.lat[cap-1] = blips[i].lat; t.lon[cap-1] = blips[i].lon;
       }
       t.lastSeenMs = nowMs;
     }
+    const uint16_t trailColors[3] = { cfg.cTrOver, cfg.cTrDep, cfg.cTrArr };  // TC_OVER, TC_DEP, TC_ARR
     for (uint8_t s = 0; s < TRAIL_SLOTS; s++) {
       TrailHistory &t = trails[s];
       if (!t.callsign[0]) continue;
-      if (nowMs - t.lastSeenMs > TRAIL_STALE_MS) { t.reset(); continue; }
+      if (nowMs - t.lastSeenMs > (uint32_t)cfg.trailStale * 1000UL) { t.reset(); continue; }
         // Connected polyline, not separate dots -- a trail of isolated 2-3px
         // dots is nearly indistinguishable from noise at this scale (typical
         // sample-to-sample movement is only a few px), and doesn't read as
         // "a path" the way a real radar trace does.
         const Blip *owner = findBlipByCallsign(t.callsign);
-        uint16_t trailColor = owner ? TRAIL_COLORS[classifyBlip(*owner)] : TRAIL_COLORS[TC_OVER];
+        uint16_t trailColor = owner ? trailColors[classifyBlip(*owner, cfg.cNear, cfg.cAlt, cfg.cVr)] : cfg.cTrOver;
         int prevPx = 0, prevPy = 0; bool havePrev = false;
         for (uint16_t j = 0; j < t.count; j++) {
-          double dist = haversineKm(cfg.hLat, cfg.hLon, t.lat[j], t.lon[j]);
-          float fr = (float)(dist / cfg.rMax);
+          float dist, brg;
+          trailPolar((float)cfg.hLat, (float)cfg.hLon, (float)t.lat[j], (float)t.lon[j], dist, brg);
+          float fr = dist / cfg.rMax;
           if (fr > 1) { havePrev = false; continue; }
           int rr = (int)(fr * R);
-          double brg = bearingDeg(cfg.hLat, cfg.hLon, t.lat[j], t.lon[j]);
-          int px = cx + (int)(sin(deg2rad(brg)) * rr);
-          int py = cy - (int)(cos(deg2rad(brg)) * rr);
+          float br = brg * (float)PI / 180.0f;
+          int px = cx + (int)(sinf(br) * rr);
+          int py = cy - (int)(cosf(br) * rr);
           if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, trailColor);
           prevPx = px; prevPy = py; havePrev = true;
         }
     }
     // Key sits in the corner of the radar area, clear of the circle.
-    drawTrailKey(L.full ? 830 : 870, L.full ? 420 : 460);
+    if (cfg.sKey) drawTrailKey(L.full ? 830 : 870, L.full ? 420 : 460,
+                               cfg.cTrDep, cfg.cTrArr, cfg.cTrOver, cfg.cAirpt);
   }
 
   gfx->setTextSize(2);
@@ -913,7 +954,8 @@ void drawRadarCommon(const RadarLayout &L) {
   LabelRect placed[MAX_BLIPS];
   int placedCount = 0;
 
-  for (uint8_t i = 0; i < blipCount; i++) {
+  uint8_t maxB = cfg.maxBlips < blipCount ? cfg.maxBlips : blipCount;
+  for (uint8_t i = 0; i < maxB; i++) {
       double la = blips[i].lat, lo = blips[i].lon;
       if (blips[i].speedMs > 0 && elapsed > 0)
         projectLatLon(blips[i].lat, blips[i].lon, blips[i].track, blips[i].speedMs * elapsed, la, lo);
@@ -928,7 +970,7 @@ void drawRadarCommon(const RadarLayout &L) {
       int by = cy - (int)(cos(deg2rad(brg)) * rr);
 
       float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
-      uint16_t blipColor = (behind < 30) ? YELLOW : GREEN;
+      uint16_t blipColor = (behind < 30) ? cfg.cBlipHi : cfg.cBlip;
       if (strcmp(blips[i].category, "A7") == 0)
         drawHelicopterIcon(bx, by, blips[i].track, blipColor);
       else
@@ -1180,7 +1222,13 @@ void renderRadar(bool justEntered) {
   uint8_t cur = screen % LCD7B_NUM_SCREENS;
   const RadarLayout L = radarLayout(cur);
 
-  bool needFull = justEntered || (now - lastFull >= 500);
+  // The fast path needs these three config values without a full snapshot.
+  float swpSec; uint16_t cSweepCol, redrawMs;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  swpSec = sweepPeriodSec; cSweepCol = colSweep; redrawMs = radarRedrawMs;
+  if (configMutex) xSemaphoreGive(configMutex);
+
+  bool needFull = justEntered || (now - lastFull >= redrawMs);
   if (needFull) {
     lastFull = now;
 
@@ -1225,13 +1273,13 @@ void renderRadar(bool justEntered) {
   if (now - lastSweep < 30) return;
   lastSweep = now;
 
-  float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
+  float sweepDeg = fmodf(millis() / (swpSec * 1000.0f / 360.0f), 360.0f);
   double sw = deg2rad(sweepDeg);
   int newX = L.cx + (int)(sin(sw) * L.R);
   int newY = L.cy - (int)(cos(sw) * L.R);
 
   if (havePrevSweep[drawBufIdx]) gfx->drawLine(L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx], BLACK);
-  gfx->drawLine(L.cx, L.cy, newX, newY, GREEN);
+  gfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
   prevSweepX[drawBufIdx] = newX;
   prevSweepY[drawBufIdx] = newY;
   havePrevSweep[drawBufIdx] = true;

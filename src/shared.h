@@ -40,6 +40,33 @@ extern bool   showTraces;  // radar flight-path trails, off by default like the 
 // not a fixed code mapping), so a live call still happens whenever Route is on.
 extern bool   preferLocalTables;
 
+// ---------------------------------------------------------------------------
+// Extended radar/display configuration (all persisted to NVS, all editable
+// from the web config page; defaults in data.cpp match the previously
+// hardcoded behavior). Colors are RGB565. Currently consumed by the
+// LCD-7B v2 display engine only — other boards ignore them.
+// ---------------------------------------------------------------------------
+extern uint8_t  maxBlipsShown;     // 1..MAX_BLIPS, how many blips+labels to draw
+extern uint16_t trailMaxSamples;   // cap on trail history length (<= 1800)
+extern uint16_t trailStaleSec;     // drop a trail after this many seconds unseen
+extern float    classNearKm;       // takeoff/landing: max distance to an airport
+extern uint16_t classMaxAltFt;     // takeoff/landing: max altitude
+extern int16_t  classVrateFpm;     // takeoff/landing: min |vertical rate|
+extern float    sweepPeriodSec;    // seconds per full sweep revolution
+extern uint16_t radarRedrawMs;     // full-redraw interval on radar screens
+extern uint16_t fetchIntervalSec;  // aircraft data poll interval
+extern bool     showAirports;
+extern bool     showTrailKey;
+extern bool     showCompass;
+extern uint16_t colSweep;
+extern uint16_t colBlip;           // blip color once the sweep has passed
+extern uint16_t colBlipHi;         // blip color just behind the sweep
+extern uint16_t colRings;          // range rings + axes
+extern uint16_t colAirport;        // airport markers + IATA labels
+extern uint16_t colTrailDep;       // trace: taking off
+extern uint16_t colTrailArr;       // trace: landing
+extern uint16_t colTrailOver;      // trace: flying over
+
 extern SemaphoreHandle_t configMutex;  // protects homeLat/Lon/radarMaxKm/toggles
 extern WebServer server;
 extern Preferences prefs;

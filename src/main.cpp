@@ -45,6 +45,26 @@ void setup() {
   showType = prefs.getBool("type", showType);
   showTraces = prefs.getBool("traces", showTraces);
   preferLocalTables = prefs.getBool("tables", preferLocalTables);
+  maxBlipsShown = prefs.getUChar("maxblips", maxBlipsShown);
+  sweepPeriodSec = prefs.getFloat("swpsec", sweepPeriodSec);
+  radarRedrawMs = prefs.getUShort("redrawms", radarRedrawMs);
+  fetchIntervalSec = prefs.getUShort("fetchsec", fetchIntervalSec);
+  trailMaxSamples = prefs.getUShort("trailsamp", trailMaxSamples);
+  trailStaleSec = prefs.getUShort("trailstale", trailStaleSec);
+  classNearKm = prefs.getFloat("cnearkm", classNearKm);
+  classMaxAltFt = prefs.getUShort("cmaxalt", classMaxAltFt);
+  classVrateFpm = prefs.getShort("cvrate", classVrateFpm);
+  showAirports = prefs.getBool("showapt", showAirports);
+  showTrailKey = prefs.getBool("showkey", showTrailKey);
+  showCompass = prefs.getBool("showcomp", showCompass);
+  colSweep = prefs.getUShort("c_sweep", colSweep);
+  colBlip = prefs.getUShort("c_blip", colBlip);
+  colBlipHi = prefs.getUShort("c_bliphi", colBlipHi);
+  colRings = prefs.getUShort("c_rings", colRings);
+  colAirport = prefs.getUShort("c_airpt", colAirport);
+  colTrailDep = prefs.getUShort("c_trdep", colTrailDep);
+  colTrailArr = prefs.getUShort("c_trarr", colTrailArr);
+  colTrailOver = prefs.getUShort("c_trover", colTrailOver);
   applyInvertColors(invertColors);
   applyBrightness(brightness);
   Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d bright=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
