@@ -9,3 +9,8 @@ compile_commands.json
 
 # Secrets — copy config.env.example to config.env and fill in your values
 src/config.env
+
+# pioarduino HybridCompile artifacts (lcd7b_v2 custom_sdkconfig builds)
+managed_components/
+sdkconfig.defaults
+sdkconfig.*
