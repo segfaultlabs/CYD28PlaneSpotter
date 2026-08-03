@@ -264,11 +264,13 @@ void initRGBPanel() {
   // (bounce-buffer underrun) at each: 10MHz ok (zero-copy build) ->
   // 16MHz ok -> 20MHz ok -> 22MHz UNSTABLE (drift — right at Espressif's
   // ~22MHz tested ceiling for octal PSRAM @80MHz, no margin).
-  // 30MHz: enabled by the phase-3 build config (120MHz octal PSRAM + 120MHz
-  // flash via board_build.f_flash + custom_sdkconfig — see platformio.ini,
-  // and Espressif's tested "~30MHz with octal PSRAM @120MHz"). Needs
-  // USB-flashing (bootloader change), soak-tested via /health.
-  cfg.timings.pclk_hz = 30000000;
+  // 30MHz requires the 120MHz-PSRAM build config, which lives in
+  // [env:lcd7b_v3] (USB-flash-only — see platformio.ini). Set per-env via
+  // LCD7B_PCLK_HZ so a stable v2 build can never accidentally carry 30MHz.
+  #ifndef LCD7B_PCLK_HZ
+  #define LCD7B_PCLK_HZ 20000000
+  #endif
+  cfg.timings.pclk_hz = LCD7B_PCLK_HZ;
   cfg.timings.h_res = LCD_W;
   cfg.timings.v_res = LCD_H;
   cfg.timings.hsync_pulse_width = 162;
@@ -1101,11 +1103,11 @@ void displaySetup() {
   server.on("/health", []() {
     char buf[512];
     snprintf(buf, sizeof(buf),
-      "uptime_s: %lu\nreset_reason: %d\nheap_free: %u\nheap_min_free: %u\npsram_free: %u\n"
+      "uptime_s: %lu\nreset_reason: %d\nheap_free: %u\nheap_min_free: %u\nheap_largest_block: %u\npsram_free: %u\n"
       "rssi_dbm: %d\nscreen: %u\nfill_us: %lu\ndraw_us: %lu\npush_us: %lu\nframe_interval_ms: %lu\n"
       "blips: %u\napi_ok: %lu\napi_fail: %lu\n",
       (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
-      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getFreePsram(),
+      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (unsigned)ESP.getFreePsram(),
       (int)WiFi.RSSI(), screen,
       (unsigned long)lastFillUs, (unsigned long)lastDrawUs, (unsigned long)lastPushUs,
       (unsigned long)lastFrameIntervalMs,
