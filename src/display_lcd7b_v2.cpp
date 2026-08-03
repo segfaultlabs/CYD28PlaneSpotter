@@ -372,10 +372,33 @@ DirectCanvas *directGfx = new DirectCanvas(LCD_W, LCD_H);
 // canvas — all screen code draws through this, unaware of the retargeting.
 Arduino_GFX *gfx = directGfx;
 
-// Third PSRAM framebuffer: the staged radar redraw renders the next frame
-// here in small slices between sweep ticks, then it's band-copied into the
-// panel framebuffers (see renderRadar). Allocated in displaySetup().
-static Arduino_Canvas *stagingCanvas = nullptr;
+// Third PSRAM framebuffers: the staged radar redraw renders the next frame
+// into one of them in small slices between sweep ticks (ping-pong), then
+// it's band-copied into the panel framebuffers (see renderRadar). The other
+// always holds the last COMPLETED frame (bgFrame) and serves as the clean
+// background source for sweep-line erases — see restoreLine().
+static Arduino_Canvas *stagingCanvas[2] = { nullptr, nullptr };
+static uint8_t stgRenderIdx = 0;              // which staging buffer the current cycle renders into
+static Arduino_Canvas *bgFrame = nullptr;     // last completed full frame (valid background source)
+
+// Erases a line by RESTORING the background under it from a source frame
+// buffer instead of painting BLACK. Erasing to black cut a 1px gash through
+// any label/ring/trail the sweep crossed, which accumulated into visibly
+// "fuzzy" plane names between full redraws (sweep stayed clean — the damage
+// was to the text). Bresenham over raw RGB565 buffers.
+static void restoreLine(uint16_t *dst, const uint16_t *src, int x0, int y0, int x1, int y1) {
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  for (;;) {
+    if (x0 >= 0 && x0 < LCD_W && y0 >= 0 && y0 < LCD_H)
+      dst[(size_t)y0 * LCD_W + x0] = src[(size_t)y0 * LCD_W + x0];
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
 
 // Presents the just-drawn frame: hands the driver the pointer of the buffer
 // the canvas drew into. Verified against esp_lcd_panel_rgb.c @ v5.5.5 (the
@@ -1189,11 +1212,17 @@ void displaySetup() {
   if (!directGfx->begin()) {
     Serial.println("[lcd7b] Failed to initialize display!");
   }
-  // Staging canvas for the sliced radar redraw (own 1.2MB PSRAM buffer).
-  stagingCanvas = new Arduino_Canvas(LCD_W, LCD_H, nullptr);
-  if (!stagingCanvas->begin()) {
-    Serial.println("[lcd7b] Failed to allocate staging canvas!");
+  // Staging canvases for the sliced radar redraw (2x own 1.2MB PSRAM
+  // buffers, ping-pong). bgFrame starts as an all-black fallback; the first
+  // completed staged cycle (or screen-entry sync) makes it a valid source.
+  stagingCanvas[0] = new Arduino_Canvas(LCD_W, LCD_H, nullptr);
+  stagingCanvas[1] = new Arduino_Canvas(LCD_W, LCD_H, nullptr);
+  if (!stagingCanvas[0]->begin() || !stagingCanvas[1]->begin()) {
+    Serial.println("[lcd7b] Failed to allocate staging canvases!");
   }
+  stagingCanvas[0]->fillScreen(BLACK);
+  stagingCanvas[1]->fillScreen(BLACK);
+  bgFrame = stagingCanvas[0];
   gfx->fillScreen(BLACK);
   gfx->setCursor(20, 100);
   gfx->setTextSize(4);
@@ -1262,13 +1291,14 @@ static bool havePrevSweep[2] = { false, false };
 void runStagingSlice(const RadarLayout &L) {
   const int bandH = LCD_H / 4;
   const size_t bandBytes = (size_t)bandH * LCD_W * sizeof(uint16_t);
+  Arduino_Canvas *stg = stagingCanvas[stgRenderIdx];
   switch (slice) {
     case SL_FILL_A:
-      stagingCanvas->fillRect(0, 0, LCD_W, LCD_H / 2, BLACK);
+      stg->fillRect(0, 0, LCD_W, LCD_H / 2, BLACK);
       slice = SL_FILL_B;
       break;
     case SL_FILL_B:
-      stagingCanvas->fillRect(0, LCD_H / 2, LCD_W, LCD_H - LCD_H / 2, BLACK);
+      stg->fillRect(0, LCD_H / 2, LCD_W, LCD_H - LCD_H / 2, BLACK);
       slice = SL_STATIC;
       break;
     case SL_STATIC: {
@@ -1306,14 +1336,17 @@ void runStagingSlice(const RadarLayout &L) {
       // presents during the copy phase.
       int band = slice - SL_COPY_A;
       memcpy((uint8_t *)panelFbs[drawBufIdx] + (size_t)band * bandBytes,
-             (uint8_t *)stagingCanvas->getFramebuffer() + (size_t)band * bandBytes,
+             (uint8_t *)stg->getFramebuffer() + (size_t)band * bandBytes,
              bandBytes);
       slice = (band == 3) ? SL_SWAP : (StageSlice)(slice + 1);
       break;
     }
     case SL_SWAP:
-      // The ONE atomic content swap of the cycle.
+      // The ONE atomic content swap of the cycle. The staged frame is now
+      // displayed, so it also becomes the valid background source for
+      // sweep-line erases from here on.
       pushFrame();
+      bgFrame = stagingCanvas[stgRenderIdx];
       prevSweepX[drawBufIdx ^ 1] = drawnSweepX;
       prevSweepY[drawBufIdx ^ 1] = drawnSweepY;
       havePrevSweep[drawBufIdx ^ 1] = true;
@@ -1324,7 +1357,7 @@ void runStagingSlice(const RadarLayout &L) {
       // waitFrameDone) so buffer flips don't alternate content.
       int band = slice - SL_SYNC_A;
       memcpy((uint8_t *)panelFbs[drawBufIdx] + (size_t)band * bandBytes,
-             (uint8_t *)stagingCanvas->getFramebuffer() + (size_t)band * bandBytes,
+             (uint8_t *)stg->getFramebuffer() + (size_t)band * bandBytes,
              bandBytes);
       if (band == 3) {
         prevSweepX[drawBufIdx] = drawnSweepX;
@@ -1384,6 +1417,9 @@ void renderRadar(bool justEntered) {
 
     // Sync the OTHER framebuffer to the frame just presented (see SL_SYNC).
     memcpy(panelFbs[drawBufIdx], panelFbs[drawBufIdx ^ 1], (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+    // Keep the background-source frame in step with what's on screen, so
+    // sweep-line erases restore the right pixels.
+    memcpy(bgFrame->getFramebuffer(), panelFbs[drawBufIdx ^ 1], (size_t)LCD_W * LCD_H * sizeof(uint16_t));
     prevSweepX[drawBufIdx] = drawnSweepX;
     prevSweepY[drawBufIdx] = drawnSweepY;
     havePrevSweep[drawBufIdx] = true;
@@ -1406,7 +1442,7 @@ void renderRadar(bool justEntered) {
       int newY = L.cy - (int)(cos(sw) * L.R);
       uint8_t act = drawBufIdx ^ 1;
       directGfx->setBuffer(panelFbs[act]);
-      if (havePrevSweep[act]) directGfx->drawLine(L.cx, L.cy, prevSweepX[act], prevSweepY[act], BLACK);
+      if (havePrevSweep[act]) restoreLine(panelFbs[act], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[act], prevSweepY[act]);
       directGfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
       prevSweepX[act] = newX; prevSweepY[act] = newY; havePrevSweep[act] = true;
       return;
@@ -1424,14 +1460,15 @@ void renderRadar(bool justEntered) {
     int newX = L.cx + (int)(sin(sw) * L.R);
     int newY = L.cy - (int)(cos(sw) * L.R);
     directGfx->setBuffer(panelFbs[drawBufIdx]);
-    if (havePrevSweep[drawBufIdx]) gfx->drawLine(L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx], BLACK);
+    if (havePrevSweep[drawBufIdx]) restoreLine(panelFbs[drawBufIdx], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx]);
     gfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
     prevSweepX[drawBufIdx] = newX; prevSweepY[drawBufIdx] = newY; havePrevSweep[drawBufIdx] = true;
     pushFrame();
     return;
   }
   if (now - lastFullCycle >= redrawMs) {
-    gfx = stagingCanvas;
+    stgRenderIdx ^= 1;  // ping-pong: render into the OTHER staging buffer, keeping the last complete frame valid as bgFrame
+    gfx = stagingCanvas[stgRenderIdx];
     slice = SL_FILL_A;
   }
 }
