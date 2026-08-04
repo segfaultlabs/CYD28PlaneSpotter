@@ -889,12 +889,78 @@ void screenRadarFull() { drawRadarAll(radarLayout(4)); }
 // Screen furniture around the radar circle: header + left info column +
 // zoom buttons (classic layout), or corner readouts + big zoom buttons
 // (full-screen layout).
+// Animated weather widget (~44x36px): sun with slowly rotating rays by day,
+// crescent moon + twinkling stars by night, drifting clouds, falling rain,
+// flashing storm. All motion is driven by a 2Hz frame counter — the widget
+// is furniture inside the staged redraw, so the animation is free (no
+// per-frame work).
+void drawWeatherWidget(int x, int y, int code) {
+  uint32_t f = millis() / 500;
+  bool night = isNightNow();
+  bool cloudy = (code >= 1 && code <= 3) || code == 45 || code == 48 ||
+                (code >= 51 && code <= 67) || (code >= 71 && code <= 77) ||
+                (code >= 80 && code <= 82) || code == 85 || code == 86 || code >= 95;
+  bool rain = (code >= 51 && code <= 67) || (code >= 80 && code <= 82);
+  bool snow = (code >= 71 && code <= 77) || code == 85 || code == 86;
+  bool storm = code >= 95;
+
+  if (!cloudy || code <= 3) {
+    if (night) {
+      // Crescent moon (pale circle with offset cutout) + blinking stars
+      gfx->fillCircle(x + 14, y + 12, 8, LIGHTGREY);
+      gfx->fillCircle(x + 18, y + 10, 7, BLACK);
+      if (f % 2 == 0) {
+        gfx->drawPixel(x + 30, y + 4, WHITE);
+        gfx->drawPixel(x + 36, y + 12, WHITE);
+      } else {
+        gfx->drawPixel(x + 32, y + 8, WHITE);
+      }
+    } else {
+      // Sun with rays rotating ~15deg per cycle
+      int sx = x + 16, sy = y + 12;
+      gfx->fillCircle(sx, sy, 7, YELLOW);
+      float a0 = (f % 24) * (2.0f * (float)PI / 24.0f);
+      for (int i = 0; i < 8; i++) {
+        float a = a0 + i * (float)PI / 4.0f;
+        gfx->drawLine(sx + (int)(sinf(a) * 10), sy - (int)(cosf(a) * 10),
+                      sx + (int)(sinf(a) * 14), sy - (int)(cosf(a) * 14), YELLOW);
+      }
+    }
+  }
+
+  if (code == 45 || code == 48) {  // fog
+    for (int i = 0; i < 3; i++)
+      gfx->drawFastHLine(x + 4 + (i == (int)(f % 3) ? 3 : 0), y + 14 + i * 5, 26, LIGHTGREY);
+  } else if (cloudy) {
+    int drift = (int)(sinf((f % 40) * (2.0f * (float)PI / 40.0f)) * 3);
+    drawCloudShape(x + 8 + drift, y + 12, LIGHTGREY);
+  }
+
+  if (rain) {
+    for (int i = 0; i < 3; i++) {
+      int dy = (int)((f + i) % 3) * 4;
+      gfx->drawLine(x + 12 + i * 7, y + 24 + dy, x + 10 + i * 7, y + 28 + dy, CYAN);
+    }
+  } else if (snow) {
+    for (int i = 0; i < 3; i++) {
+      int dx = (int)(f % 2) * 2;
+      int sx2 = x + 12 + i * 7 + dx, sy2 = y + 25 + (i % 2) * 3;
+      gfx->drawFastHLine(sx2 - 2, sy2, 5, WHITE);
+      gfx->drawFastVLine(sx2, sy2 - 2, 5, WHITE);
+    }
+  } else if (storm && f % 2 == 0) {  // bolt flashes on alternate cycles
+    gfx->drawLine(x + 18, y + 22, x + 14, y + 30, YELLOW);
+    gfx->drawLine(x + 14, y + 30, x + 20, y + 30, YELLOW);
+    gfx->drawLine(x + 20, y + 30, x + 15, y + 38, YELLOW);
+  }
+}
+
 void drawRadarFurniture(const RadarLayout &L, const RadarCfg &cfg) {
   if (L.full) {
     // Weather, top-left corner
     gfx->setTextSize(2);
     if (weather.valid) {
-      drawWeatherIcon(15, 12, weather.code);
+      drawWeatherWidget(10, 8, weather.code);
       gfx->setTextColor(CYAN, BLACK);
       gfx->setCursor(50, 16);
       gfx->printf("%.1fC   ", weather.tempC);
@@ -951,7 +1017,7 @@ void drawRadarFurniture(const RadarLayout &L, const RadarCfg &cfg) {
 
   gfx->setTextSize(2);
   if (weather.valid) {
-    drawWeatherIcon(20, 190, weather.code);
+    drawWeatherWidget(15, 185, weather.code);
     gfx->setTextColor(CYAN, BLACK);
     gfx->setCursor(55, 194);
     gfx->printf("%.1fC   ", weather.tempC);
@@ -1810,7 +1876,7 @@ void checkTouch() {
       if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
       radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
       if (configMutex) xSemaphoreGive(configMutex);
-      prefs.putFloat("range", radarMaxKm);
+      markRangeDirty();
       Serial.printf("[lcd7b] Range increased: %d km\n", (int)radarMaxKm);
       return;
     }
@@ -1818,7 +1884,7 @@ void checkTouch() {
       if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
       radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
       if (configMutex) xSemaphoreGive(configMutex);
-      prefs.putFloat("range", radarMaxKm);
+      markRangeDirty();
       Serial.printf("[lcd7b] Range decreased: %d km\n", (int)radarMaxKm);
       return;
     }

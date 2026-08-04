@@ -83,6 +83,10 @@ void setup() {
   filterQuiet = prefs.getBool("fr_quiet", filterQuiet);
   sweepGlow = prefs.getBool("swpglow", sweepGlow);
   sweepGlowLen = prefs.getUChar("swpglowlen", sweepGlowLen);
+  nightDimOn = prefs.getBool("nd_on", nightDimOn);
+  nightStartHr = prefs.getUChar("nd_start", nightStartHr);
+  nightEndHr = prefs.getUChar("nd_end", nightEndHr);
+  nightBrightPct = prefs.getUChar("nd_bright", nightBrightPct);
   applyInvertColors(invertColors);
   applyBrightness(brightness);
   Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d bright=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
@@ -126,6 +130,30 @@ void loop() {
   // WiFi health — non-blocking multi-network reconnect + fallback setup AP
   // (the radar keeps running on stale data during outages)
   wifiMaintain();
+
+  // Day/night auto-dim: switch backlight between the configured day level
+  // (brightness) and night level on a schedule, checked every 30s.
+  static uint32_t lastDimCheck = 0;  static int lastAppliedBright = -1;
+  if (!nightDimOn) {
+    lastAppliedBright = -1;  // force re-apply if re-enabled
+  } else if (now - lastDimCheck > 30000) {
+    lastDimCheck = now;
+    if (time(nullptr) > 1700000000) {
+      time_t t = time(nullptr); struct tm lt; localtime_r(&t, &lt);
+      bool night = (nightStartHr <= nightEndHr)
+        ? (lt.tm_hour >= (int)nightStartHr && lt.tm_hour < (int)nightEndHr)
+        : (lt.tm_hour >= (int)nightStartHr || lt.tm_hour < (int)nightEndHr);
+      int target = night ? (int)nightBrightPct : (int)brightness;
+      if (target != lastAppliedBright) {
+        lastAppliedBright = target;
+        applyBrightness((uint8_t)target);
+        Serial.printf("[dim] night=%d -> backlight %d%%\n", night, target);
+      }
+    }
+  }
+
+  // Deferred config persistence (NVS writes stay out of the interactive path)
+  configMaintain();
 
   // Weather fetch still runs in loop (it's infrequent, every 10 min)
   if (!firstWeatherDone || now - lastWeatherPoll >= WEATHER_INTERVAL_MS) {

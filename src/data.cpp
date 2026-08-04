@@ -50,6 +50,18 @@ bool     showTrailKey = true;
 bool     showCompass = true;
 bool     sweepGlow = true;
 uint8_t  sweepGlowLen = 6;
+bool     nightDimOn = false;
+uint8_t  nightStartHr = 22;
+uint8_t  nightEndHr = 7;
+uint8_t  nightBrightPct = 15;
+
+// Fixed day window for the weather widget (07:00-19:00 local). The
+// configurable night-dim schedule is separate (nightStartHr/nightEndHr).
+bool isNightNow() {
+  if (time(nullptr) < 1700000000) return false;
+  time_t t = time(nullptr); struct tm lt; localtime_r(&t, &lt);
+  return lt.tm_hour >= 19 || lt.tm_hour < 7;
+}
 uint16_t colSweep = 0x07E0;      // GREEN
 uint16_t colBlip = 0x07E0;       // GREEN
 uint16_t colBlipHi = 0xFFE0;     // YELLOW
@@ -114,6 +126,31 @@ void wifiLoadNetworks() {
     }
     strncpy(wifiNets[i].ssid, s.c_str(), 32); wifiNets[i].ssid[32] = '\0';
     strncpy(wifiNets[i].pass, p.c_str(), 64); wifiNets[i].pass[64] = '\0';
+  }
+}
+
+// Deferred NVS persistence for high-frequency config changes (the zoom
+// buttons). Writing NVS means a flash erase/write with the CPU cache
+// disabled, and on the LCD-7B v2 build the RGB driver's bounce-buffer
+// refill ISR is not IRAM-safe — an NVS write in the touch path visibly
+// glitches/desyncs the panel. So interactive code marks the value dirty
+// here, and configMaintain() (called from loop(), when the user has
+// stopped pressing buttons for 3s) does the actual write once.
+static volatile bool rangeDirty = false;
+static uint32_t rangeDirtyMs = 0;
+void markRangeDirty() {
+  rangeDirty = true;
+  rangeDirtyMs = millis();
+}
+void configMaintain() {
+  if (rangeDirty && millis() - rangeDirtyMs > 3000) {
+    rangeDirty = false;
+    float r;
+    if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+    r = radarMaxKm;
+    if (configMutex) xSemaphoreGive(configMutex);
+    prefs.putFloat("range", r);
+    Serial.printf("[cfg] range %.0f km persisted (deferred)\n", r);
   }
 }
 
@@ -752,6 +789,7 @@ void initWebServer() {
     uint8_t maxB; uint16_t trailSamp, trailStale, cAlt, redrawMs, fetchSec;
     float swpSec, cNear; int16_t cVr;
     bool sApt, sKey, sComp, glowOn; uint8_t glowLen;
+    bool ndOn; uint8_t ndStart, ndEnd, ndBright;
     uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors; bright = brightness;
@@ -762,6 +800,7 @@ void initWebServer() {
     swpSec = sweepPeriodSec; redrawMs = radarRedrawMs; fetchSec = fetchIntervalSec;
     sApt = showAirports; sKey = showTrailKey; sComp = showCompass;
     glowOn = sweepGlow; glowLen = sweepGlowLen;
+    ndOn = nightDimOn; ndStart = nightStartHr; ndEnd = nightEndHr; ndBright = nightBrightPct;
     cSweep = colSweep; cBlip = colBlip; cBlipHi = colBlipHi; cRings = colRings; cAirpt = colAirport;
     cTrDep = colTrailDep; cTrArr = colTrailArr; cTrOver = colTrailOver;
     if (configMutex) xSemaphoreGive(configMutex);
@@ -976,6 +1015,20 @@ void initWebServer() {
     <input type="number" step="500" name="cmaxalt" id="cmaxalt" min="500" max="45000" value=")rawliteral" + String(cAlt) + R"rawliteral(">
     <label>Min vertical rate (fpm)</label>
     <input type="number" step="50" name="cvrate" id="cvrate" min="50" max="3000" value=")rawliteral" + String(cVr) + R"rawliteral(">
+    <div class="section-hd">Day / Night Cycle</div>
+    <div class="switch-row">
+      <label for="nd_on">Auto-dim backlight at night</label>
+      <label class="switch">
+        <input type="checkbox" id="nd_on")rawliteral" + String(ndOn ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <label>Night starts at hour (0-23)</label>
+    <input type="number" name="nd_start" id="nd_start" min="0" max="23" value=")rawliteral" + String(ndStart) + R"rawliteral(">
+    <label>Night ends at hour (0-23)</label>
+    <input type="number" name="nd_end" id="nd_end" min="0" max="23" value=")rawliteral" + String(ndEnd) + R"rawliteral(">
+    <label for="nd_bright">Night brightness &mdash; <span id="ndBrightVal">)rawliteral" + String(ndBright) + R"rawliteral(</span>%</label>
+    <input type="range" name="nd_bright" id="nd_bright" min="1" max="100" value=")rawliteral" + String(ndBright) + R"rawliteral(" oninput="document.getElementById('ndBrightVal').textContent=this.value">
     <div class="section-hd">Data Fetch</div>
     <label>Aircraft poll interval (seconds, 5-600)</label>
     <input type="number" name="fetchsec" id="fetchsec" min="5" max="600" value=")rawliteral" + String(fetchSec) + R"rawliteral(">
@@ -1137,6 +1190,10 @@ function save(e){
          '&showkey='+(document.getElementById('showkey').checked?'1':'0')+
          '&swpglow='+(document.getElementById('swpglow').checked?'1':'0')+
          '&swpglowlen='+encodeURIComponent(document.getElementById('swpglowlen').value)+
+         '&nd_on='+(document.getElementById('nd_on').checked?'1':'0')+
+         '&nd_start='+encodeURIComponent(document.getElementById('nd_start').value)+
+         '&nd_end='+encodeURIComponent(document.getElementById('nd_end').value)+
+         '&nd_bright='+encodeURIComponent(document.getElementById('nd_bright').value)+
          '&fr_quiet='+(document.getElementById('fr_quiet').checked?'1':'0')+
          ruleArgs(0)+ruleArgs(1)+ruleArgs(2)+ruleArgs(3)+ruleArgs(4));
 }

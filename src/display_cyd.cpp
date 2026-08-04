@@ -733,7 +733,7 @@ void checkTouch() {
             if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
             radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
             if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
+            markRangeDirty();
             Serial.printf("Range increased: %d km\n", (int)radarMaxKm);
             lastScreenSwap = millis();
             return;
@@ -743,7 +743,7 @@ void checkTouch() {
             if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
             radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
             if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
+            markRangeDirty();
             Serial.printf("Range decreased: %d km\n", (int)radarMaxKm);
             lastScreenSwap = millis();
             return;
@@ -755,7 +755,7 @@ void checkTouch() {
             if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
             radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
             if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
+            markRangeDirty();
             Serial.printf("Range increased: %d km\n", (int)radarMaxKm);
             lastScreenSwap = millis();
             return;
@@ -765,7 +765,7 @@ void checkTouch() {
             if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
             radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
             if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
+            markRangeDirty();
             Serial.printf("Range decreased: %d km\n", (int)radarMaxKm);
             lastScreenSwap = millis();
             return;

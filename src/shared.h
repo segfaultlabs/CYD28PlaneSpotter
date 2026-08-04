@@ -60,6 +60,14 @@ extern bool     showTrailKey;
 extern bool     showCompass;
 extern bool     sweepGlow;         // phosphor afterglow behind the sweep
 extern uint8_t  sweepGlowLen;      // afterglow segments (1 = off, up to 12)
+
+// Day/night cycle: the weather widget shows sun by day / moon by night
+// (fixed 07:00-19:00 day), and the backlight can auto-dim on a schedule.
+extern bool     nightDimOn;
+extern uint8_t  nightStartHr;      // dim begins (0-23)
+extern uint8_t  nightEndHr;        // dim ends (0-23)
+extern uint8_t  nightBrightPct;    // night backlight level 1-100
+bool isNightNow();                 // true between 19:00 and 07:00 local
 extern uint16_t colSweep;
 extern uint16_t colBlip;           // blip color once the sweep has passed
 extern uint16_t colBlipHi;         // blip color just behind the sweep
@@ -215,6 +223,8 @@ static bool filterPrefixMatch(const char *s, const char *prefix) {
 void connectWiFi();  // boot-time connect: tries all saved networks, starts fallback AP if none work
 void wifiLoadNetworks();  // load NVS network slots (seed slot 0 from config.env) — call after prefs.begin
 void wifiMaintain();   // non-blocking reconnect/AP-fallback state machine — call every loop()
+void markRangeDirty();  // defer NVS persistence of radarMaxKm (see configMaintain)
+void configMaintain();  // commits deferred config writes after 3s idle — call every loop()
 bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bool allowFetch = true);
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut);
