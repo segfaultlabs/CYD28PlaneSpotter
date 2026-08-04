@@ -13,6 +13,24 @@
 #include <Update.h>
 #include "config.env"
 
+// ArduinoJson allocator that puts the document pool in PSRAM. The repeated
+// fetch-cycle pattern (TLS buffers + JSON document + big payload String in
+// internal RAM) was slowly fragmenting the internal heap — heap_min_free
+// stair-stepping down over hours and the largest contiguous block shrinking
+// toward the ~40KB a TLS handshake needs contiguous. Every JSON document on
+// the fetch path uses this allocator, and the adsb.lol payload is read into
+// a PSRAM buffer (see fetchAircraftTo).
+class PsRamAllocator : public ArduinoJson::Allocator {
+ public:
+  void* allocate(size_t size) override { return ps_malloc(size); }
+  void deallocate(void* ptr) override { free(ptr); }
+  void* reallocate(void* ptr, size_t newSize) override { return ps_realloc(ptr, newSize); }
+  static ArduinoJson::Allocator* instance() {
+    static PsRamAllocator a;
+    return &a;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Global storage (declared extern in shared.h)
 // ---------------------------------------------------------------------------
@@ -275,7 +293,7 @@ bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bo
     Serial.printf("[route] %s HTTP code=%d in %lums, heap=%u\n", callsign, code, millis() - t0, ESP.getFreeHeap());
     if (code == HTTP_CODE_OK) {
       String payload = https.getString();
-      JsonDocument d;
+      JsonDocument d(PsRamAllocator::instance());
       DeserializationError jerr = deserializeJson(d, payload);
       if (!jerr) {
         JsonObject fr = d["response"]["flightroute"];
@@ -311,6 +329,33 @@ bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bo
   return found;
 }
 
+// Stream sink that writes an HTTP response body into a PSRAM buffer — used
+// with HTTPClient::writeToStream(), which handles chunked encoding and
+// content-length streaming correctly (manual stream reads truncated the
+// payload at the first SSL record). Read side stubbed (write-only sink).
+class PsBufStream : public Stream {
+ public:
+  PsBufStream(char *buf, size_t cap) : _buf(buf), _cap(cap) {}
+  size_t write(uint8_t b) override {
+    if (_n >= _cap - 1) return 0;
+    _buf[_n++] = (char)b;
+    return 1;
+  }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    size_t room = _cap - 1 - _n;
+    size_t w = size < room ? size : room;
+    memcpy(_buf + _n, buffer, w);
+    _n += w;
+    return w;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  size_t _n = 0;
+ private:
+  char *_buf; size_t _cap;
+};
+
 // Fetches aircraft data into caller-provided local buffers (thread-safe — no globals touched)
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut) {
@@ -336,14 +381,16 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
 
   if (!https.begin(client, url)) {
     Serial.printf("[fetch] https.begin() failed, heap=%u\n", ESP.getFreeHeap());
+    stats.lastFetchStage = 1;
     stats.requestsFail++; return false;
   }
   uint32_t t0 = millis();
   int code = https.GET();
+  stats.lastHttpCode = code;
   Serial.printf("[fetch] HTTP code=%d in %lums, heap=%u\n", code, millis() - t0, ESP.getFreeHeap());
-  if (code != HTTP_CODE_OK) { https.end(); stats.requestsFail++; return false; }
+  if (code != HTTP_CODE_OK) { https.end(); stats.lastFetchStage = 2; stats.requestsFail++; return false; }
 
-  JsonDocument filter;
+  JsonDocument filter(PsRamAllocator::instance());
   JsonObject fac = filter["ac"].to<JsonArray>().add<JsonObject>();
   fac["flight"] = true; fac["lat"] = true; fac["lon"] = true;
   fac["alt_baro"] = true; fac["gs"] = true; fac["track"] = true; fac["t"] = true;
@@ -352,14 +399,32 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   // via getFlightInfo() instead (see below), which actually has the data.
   fac["r"] = true; fac["squawk"] = true; fac["baro_rate"] = true; fac["category"] = true;
 
-  String payload = https.getString(); https.end();
-  Serial.printf("[fetch] payload=%u bytes, heap after read=%u\n", payload.length(), ESP.getFreeHeap());
-  JsonDocument doc;
+  // Read the payload into a PSRAM buffer instead of an internal-heap
+  // String — the single biggest allocation of the fetch cycle (the adsb.lol
+  // response can be hundreds of KB in busy airspace). HTTPClient does the
+  // transfer mechanics; the bytes land in PSRAM. Shared static buffer, only
+  // ever used from this task.
+  static char *payloadBuf = nullptr;
+  static const size_t PAYLOAD_CAP = 384 * 1024;
+  if (!payloadBuf) payloadBuf = (char *)ps_malloc(PAYLOAD_CAP);
+  if (!payloadBuf) { stats.lastFetchStage = 3; stats.requestsFail++; return false; }
+  PsBufStream out(payloadBuf, PAYLOAD_CAP);
+  int len = https.writeToStream(&out);
+  https.end();
+  Serial.printf("[fetch] payload=%d bytes (psram), heap after read=%u\n", len, ESP.getFreeHeap());
+  stats.lastPayloadBytes = len > 0 ? (uint32_t)len : 0;
+  if (len <= 0) { stats.lastFetchStage = 3; stats.requestsFail++; return false; }
+  payloadBuf[len] = '\0';
+  const char *payload = payloadBuf;
+  JsonDocument doc(PsRamAllocator::instance());
+  strncpy(stats.lastPayloadHead, payload, 40); stats.lastPayloadHead[40] = '\0';
   DeserializationError jerr = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
   if (jerr) {
     Serial.printf("[fetch] JSON parse failed: %s, heap=%u\n", jerr.c_str(), ESP.getFreeHeap());
-    stats.requestsFail++; return false;
+    snprintf(stats.lastPayloadHead, sizeof(stats.lastPayloadHead), "ERR:%s", jerr.c_str());
+    stats.lastFetchStage = 4; stats.requestsFail++; return false;
   }
+  stats.lastFetchStage = 5;
 
   JsonArray ac = doc["ac"].as<JsonArray>();
   uint16_t count = 0;
@@ -509,13 +574,22 @@ void dataFetcherTask(void* param) {
           for (int i = 0; i < locBlipCount; i++) {
             locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, false);
           }
-          const int ROUTE_FETCH_BUDGET = 6;
-          int routeFetchesUsed = 0;
-          for (int i = 0; i < locBlipCount && routeFetchesUsed < ROUTE_FETCH_BUDGET; i++) {
-            if (locBlips[i].hasRoute) continue;
-            if (strlen(locBlips[i].callsign) == 0 || strcmp(locBlips[i].callsign, "(no id)") == 0) continue;
-            locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, true);
-            routeFetchesUsed++;
+          // Live-fetch budget only every 3rd cycle: route data is
+          // quasi-static per flight, and ~11 serial adsbdb calls per cycle
+          // were stretching the effective poll cadence to 20-40s (seen via
+          // /health data_age_ms) instead of the configured ~10s. The free
+          // cache sweep above still runs every cycle, and the cache fills
+          // in over a couple of minutes for new aircraft.
+          static uint8_t routeCycle = 0;
+          if ((routeCycle++ % 3) == 0) {
+            const int ROUTE_FETCH_BUDGET = 6;
+            int routeFetchesUsed = 0;
+            for (int i = 0; i < locBlipCount && routeFetchesUsed < ROUTE_FETCH_BUDGET; i++) {
+              if (locBlips[i].hasRoute) continue;
+              if (strlen(locBlips[i].callsign) == 0 || strcmp(locBlips[i].callsign, "(no id)") == 0) continue;
+              locBlips[i].hasRoute = getFlightInfo(locBlips[i].callsign, locBlips[i].dep, locBlips[i].arr, locBlips[i].airline, true);
+              routeFetchesUsed++;
+            }
           }
         }
       }
@@ -551,7 +625,7 @@ bool fetchWeather() {
   if (code != HTTP_CODE_OK) { https.end(); return false; }
   String payload = https.getString(); https.end();
 
-  JsonDocument doc;
+  JsonDocument doc(PsRamAllocator::instance());
   DeserializationError jerr = deserializeJson(doc, payload);
   if (jerr) { Serial.printf("[weather] JSON parse failed: %s\n", jerr.c_str()); return false; }
   JsonObject c = doc["current"]; if (c.isNull()) { Serial.println("[weather] no 'current' object"); return false; }

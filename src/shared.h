@@ -162,6 +162,9 @@ struct Stats {
   uint32_t requestsOk = 0; uint32_t requestsFail = 0;
   uint16_t inView = 0; uint16_t maxInView = 0;
   double closestEver = 1e9; uint32_t lastUpdateMs = 0;
+  int lastHttpCode = 0; uint32_t lastPayloadBytes = 0;  // last adsb.lol fetch diagnostics
+  uint8_t lastFetchStage = 0;  // 0=none 1=begin-fail 2=http-err 3=read-fail 4=json-fail 5=ok
+  char lastPayloadHead[41] = {0};  // first 40 bytes of the payload (debug)
 };
 extern Stats stats;
 
