@@ -320,10 +320,13 @@ static uint8_t drawBufIdx = 0;
 // them). See the staging section near renderRadar for how these are used.
 enum StageSlice : uint8_t {
   SL_IDLE = 0,
-  SL_FILL_A, SL_FILL_B, SL_STATIC, SL_TRAILS_A, SL_TRAILS_B, SL_BLIPS,
-  SL_COPY_A, SL_COPY_B, SL_COPY_C, SL_COPY_D,
+  SL_FILL_A, SL_FILL_B, SL_FILL_C, SL_FILL_D,
+  SL_STATIC,
+  SL_TRAILS_A, SL_TRAILS_B, SL_TRAILS_C, SL_TRAILS_D,
+  SL_BLIPS,
+  SL_COPY_A, SL_COPY_B, SL_COPY_C, SL_COPY_D, SL_COPY_E, SL_COPY_F, SL_COPY_G, SL_COPY_H,
   SL_SWAP,
-  SL_SYNC_A, SL_SYNC_B, SL_SYNC_C, SL_SYNC_D,
+  SL_SYNC_A, SL_SYNC_B, SL_SYNC_C, SL_SYNC_D, SL_SYNC_E, SL_SYNC_F, SL_SYNC_G, SL_SYNC_H,
 };
 static StageSlice slice = SL_IDLE;
 static uint32_t lastFullCycle = 0;
@@ -1174,7 +1177,16 @@ void drawRadarStatic(const RadarLayout &L, const RadarCfg &cfg) {
         memmove(t.cosB, t.cosB + drop, cap * sizeof(float));
         t.count = cap;
       }
-      trailAppend(t, cap, cfg.hLat, cfg.hLon, blips[i].lat, blips[i].lon);
+      // Store the dead-reckoned position (same projection as the blip icon)
+      // so the trail's tail meets the plane instead of lagging it by the
+      // data age (trails used to end at the last REPORTED position while
+      // the icon flew ahead — "trace lines don't catch up to the planes").
+      double pla = blips[i].lat, plo = blips[i].lon;
+      if (blips[i].speedMs > 0) {
+        float el = (nowMs - lastDataMs) / 1000.0f;
+        if (el > 0) projectLatLon(blips[i].lat, blips[i].lon, blips[i].track, blips[i].speedMs * el, pla, plo);
+      }
+      trailAppend(t, cap, cfg.hLat, cfg.hLon, pla, plo);
       t.lastSeenMs = nowMs;
     }
   }
@@ -1635,22 +1647,20 @@ static void sweepGlowSeed(uint8_t idx, int x, int y) {
 // machine. Called only when no sweep tick is due, so the sweep never waits
 // on content rendering.
 void runStagingSlice(const RadarLayout &L) {
-  const int bandH = LCD_H / 4;
+  const int bandH = LCD_H / 8;  // copy/sync band height (8 slices per fb copy)
   const size_t bandBytes = (size_t)bandH * LCD_W * sizeof(uint16_t);
   Arduino_Canvas *stg = stagingCanvas[stgRenderIdx];
   switch (slice) {
-    case SL_FILL_A:
-      // Raw memset, not canvas fillRect: ROM memset does 32-bit stores in a
-      // single flat call (~40ms for the full frame vs ~74ms through the
-      // canvas's per-row path — PSRAM write bandwidth is the wall either way).
-      memset(stg->getFramebuffer(), 0, (size_t)LCD_W * (LCD_H / 2) * sizeof(uint16_t));
-      slice = SL_FILL_B;
+    case SL_FILL_A: case SL_FILL_B: case SL_FILL_C: case SL_FILL_D: {
+      // Raw memset in quarters (~10ms each) — smaller slices keep the sweep
+      // tick cadence (and with it the afterglow spacing) regular. ROM memset
+      // does 32-bit stores in a single flat call.
+      int band = slice - SL_FILL_A;
+      const size_t q = (size_t)LCD_W * LCD_H / 4 * sizeof(uint16_t);
+      memset((uint8_t *)stg->getFramebuffer() + (size_t)band * q, 0, q);
+      slice = (band == 3) ? SL_STATIC : (StageSlice)(slice + 1);
       break;
-    case SL_FILL_B:
-      memset((uint8_t *)stg->getFramebuffer() + (size_t)LCD_W * (LCD_H / 2) * sizeof(uint16_t), 0,
-             (size_t)LCD_W * (LCD_H - LCD_H / 2) * sizeof(uint16_t));
-      slice = SL_STATIC;
-      break;
+    }
     case SL_STATIC: {
       RadarCfg cfg = radarCfgSnapshot();
       if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1660,15 +1670,15 @@ void runStagingSlice(const RadarLayout &L) {
       slice = SL_TRAILS_A;
       break;
     }
-    case SL_TRAILS_A:
-    case SL_TRAILS_B: {
+    case SL_TRAILS_A: case SL_TRAILS_B: case SL_TRAILS_C: case SL_TRAILS_D: {
       RadarCfg cfg = radarCfgSnapshot();
-      uint8_t from = (slice == SL_TRAILS_A) ? 0 : TRAIL_SLOTS / 2;
-      uint8_t to = (slice == SL_TRAILS_A) ? TRAIL_SLOTS / 2 : TRAIL_SLOTS;
+      uint8_t from = (uint8_t)((slice - SL_TRAILS_A) * 5);
+      uint8_t to = from + 5;
+      if (to > TRAIL_SLOTS) to = TRAIL_SLOTS;
       if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
       drawRadarTrails(L, cfg, from, to);
       if (dataMutex) xSemaphoreGive(dataMutex);
-      slice = (slice == SL_TRAILS_A) ? SL_TRAILS_B : SL_BLIPS;
+      slice = (slice == SL_TRAILS_D) ? SL_BLIPS : (StageSlice)(slice + 1);
       break;
     }
     case SL_BLIPS: {
@@ -1680,7 +1690,8 @@ void runStagingSlice(const RadarLayout &L) {
       slice = SL_COPY_A;
       break;
     }
-    case SL_COPY_A: case SL_COPY_B: case SL_COPY_C: case SL_COPY_D: {
+    case SL_COPY_A: case SL_COPY_B: case SL_COPY_C: case SL_COPY_D:
+    case SL_COPY_E: case SL_COPY_F: case SL_COPY_G: case SL_COPY_H: {
       // staging -> inactive fb, one band per slice. drawBufIdx's fb is free:
       // the last present's waitFrameDone() guaranteed it, and nothing
       // presents during the copy phase.
@@ -1688,7 +1699,7 @@ void runStagingSlice(const RadarLayout &L) {
       memcpy((uint8_t *)panelFbs[drawBufIdx] + (size_t)band * bandBytes,
              (uint8_t *)stg->getFramebuffer() + (size_t)band * bandBytes,
              bandBytes);
-      slice = (band == 3) ? SL_SWAP : (StageSlice)(slice + 1);
+      slice = (band == 7) ? SL_SWAP : (StageSlice)(slice + 1);
       break;
     }
     case SL_SWAP:
@@ -1700,14 +1711,15 @@ void runStagingSlice(const RadarLayout &L) {
       sweepGlowSeed(drawBufIdx ^ 1, drawnSweepX, drawnSweepY);
       slice = SL_SYNC_A;
       break;
-    case SL_SYNC_A: case SL_SYNC_B: case SL_SYNC_C: case SL_SYNC_D: {
+    case SL_SYNC_A: case SL_SYNC_B: case SL_SYNC_C: case SL_SYNC_D:
+    case SL_SYNC_E: case SL_SYNC_F: case SL_SYNC_G: case SL_SYNC_H: {
       // Mirror the staged frame into the other fb (free since SL_SWAP's
       // waitFrameDone) so buffer flips don't alternate content.
       int band = slice - SL_SYNC_A;
       memcpy((uint8_t *)panelFbs[drawBufIdx] + (size_t)band * bandBytes,
              (uint8_t *)stg->getFramebuffer() + (size_t)band * bandBytes,
              bandBytes);
-      if (band == 3) {
+      if (band == 7) {
         sweepGlowSeed(drawBufIdx, drawnSweepX, drawnSweepY);
         slice = SL_IDLE;
         lastFullCycle = millis();
@@ -1790,11 +1802,13 @@ void renderRadar(bool justEntered) {
     } else {
       // Copy/swap/sync phase: present would alternate content, so draw
       // directly into the ACTIVE fb — but only right after VSYNC, so the
-      // write lands in the vblank gap and never splits the line mid-scan.
+      // write lands in the vblank gap (~4ms). A full afterglow update (up to
+      // 24 line writes) would overflow vblank into the active scan and
+      // reintroduce splits, so this phase uses the plain single line.
       uint8_t act = drawBufIdx ^ 1;
       uint32_t v0 = vsyncCount, tW = millis();
       while (vsyncCount == v0 && millis() - tW < 60) { delay(1); }
-      sweepGlowTick(act, L.cx, L.cy, newX, newY, cSweepCol, glowK);
+      sweepGlowTick(act, L.cx, L.cy, newX, newY, cSweepCol, 1);
     }
     // Timestamp AFTER the blocking present — not at tick start. The tick's
     // own frame-completion wait (~46ms) used to count toward the 30ms

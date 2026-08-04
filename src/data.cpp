@@ -1164,7 +1164,11 @@ void initWebServer() {
 </div>
 <div class="info">IP: )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
-// --- Location map (Leaflet + OSM; tiles load in the browser, not the device)
+// --- Location map (Leaflet + OSM; tiles load in the browser, not the
+// device). Guarded: if the CDN is unreachable (blocked/offline), L is
+// undefined — without this guard the whole script block would die and even
+// Save would break (that was the "map isn't working" bug).
+if (window.L) {
 var map = L.map('map').setView([)rawliteral" + String(hLat, 6) + R"rawliteral(, )rawliteral" + String(hLon, 6) + R"rawliteral(], 9);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(map);
 var marker = L.marker([)rawliteral" + String(hLat, 6) + R"rawliteral(, )rawliteral" + String(hLon, 6) + R"rawliteral(], {draggable: true}).addTo(map);
@@ -1195,6 +1199,7 @@ function useMyLocation() {
     map.setView([pos.coords.latitude, pos.coords.longitude], 11);
   });
 }
+}  // end if (window.L)
 // --- filter rules init
 function initRule(i,en,m,t,a,c){
   document.getElementById('fr_en'+i).checked=(en==1);
