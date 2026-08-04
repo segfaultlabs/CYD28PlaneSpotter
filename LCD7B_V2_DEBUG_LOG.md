@@ -204,6 +204,27 @@ high-pclk stability, but both need a custom sdkconfig.
   timings, API stats — for remote slowdown/crash monitoring.
 **Status: kept, verified on hardware.**
 
+### 19. Sweep jitter: phase-correct sweep updates + vsync-aligned direct draws
+User report: "weird artifacts, jittery" on the staged-redraw build. Root
+cause: during the ENTIRE staged cycle (which occupies most of every 500ms),
+the sweep was drawn directly into the framebuffer the panel was actively
+scanning, at arbitrary scan positions — an erase+rewrite mid-scan splits
+the line at the scan point for a frame, repeating every tick = visible
+jitter. The "1px write mid-scan is invisible" assumption in the staged
+design was wrong at this duty cycle. Fix, two parts:
+1. **Phase-correct update mode.** The zero-copy tick (erase+draw in the
+   INACTIVE fb + O(1) present) is actually safe for most of the staged
+   cycle — fill/static/trails/blips slices only touch the staging canvas,
+   so both panel fbs stay in sync and presents are fine. Only the
+   copy/swap/sync phase (~150ms per cycle) forbids presents (fbs
+   temporarily differ). Direct active-fb writes now happen only there.
+2. **Vsync alignment for the unavoidable direct draws.** Registered the
+   driver's `on_vsync` callback (free unless used — verified in
+   esp_lcd_panel_rgb.c @ v5.5.5); direct draws wait for vblank (~4ms
+   window) so the erase+rewrite completes before the scan reaches the
+   line's pixels — no more mid-scan splits.
+**Status: kept, verified on hardware (user-confirmed).**
+
 ### 18. Core performance pass (web→Core0, trail polar cache, memset fills) + sweep-artifact fix
 Deep-dive research (Espressif docs/FAQ, esp_lcd v5.5.5 driver source,
 project-x51 and Qiita S3 memory benchmarks) established the ground rules:

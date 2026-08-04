@@ -337,6 +337,15 @@ IRAM_ATTR static bool onFrameBufComplete(esp_lcd_panel_handle_t panel, const esp
   xSemaphoreGiveFromISR(frameDoneSem, &hpw);
   return hpw == pdTRUE;
 }
+// Incremented every VSYNC (panel scan-out start). Direct (active-buffer)
+// sweep writes wait on this and land in the vblank gap (~4ms), so they never
+// split the line mid-scan — arbitrary-timing active-fb writes were the
+// visible "jittery sweep" artifact.
+static volatile uint32_t vsyncCount = 0;
+IRAM_ATTR static bool onVsync(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
+  vsyncCount++;
+  return false;
+}
 static void waitFrameDone() {
   while (xSemaphoreTake(frameDoneSem, 0) == pdTRUE) {}  // drain stale signal
   xSemaphoreTake(frameDoneSem, pdMS_TO_TICKS(200));
@@ -420,6 +429,7 @@ void initRGBPanel() {
   frameDoneSem = xSemaphoreCreateBinary();
   esp_lcd_rgb_panel_event_callbacks_t cbs = {};
   cbs.on_frame_buf_complete = onFrameBufComplete;
+  cbs.on_vsync = onVsync;
   ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panelHandle, &cbs, NULL));
 
   // Fetch the driver's own two framebuffers so the canvas can draw directly
@@ -1326,20 +1336,31 @@ void applyBrightness(uint8_t percent) {
 }
 
 // --- Staged (scheduled) radar redraw -------------------------------------
-// A monolithic full redraw costs ~200-300ms (fillScreen ~74ms + trails/
-// blips ~60-230ms + present + a 1.2MB back-buffer sync) and used to run as
-// one blocking burst every radarRedrawMs — the sweep visibly froze twice a
-// second and read as "tearing". Instead, the next frame is rendered into a
-// third PSRAM buffer (stagingCanvas) in small slices in the gaps between
-// sweep ticks, band-copied into the inactive panel fb, swapped in with ONE
-// atomic present, then mirrored into the other fb in 4 more band slices.
-// The sweep animates continuously throughout: between cycles it uses the
-// usual zero-copy flip; during a staged cycle it is drawn directly into the
-// ACTIVE fb (a 1px-line write mid-scan is invisible in practice).
+// A monolithic full redraw costs ~200-300ms (fill + trails/blips + present
+// + back-buffer sync) and used to run as one blocking burst every
+// radarRedrawMs — the sweep visibly froze twice a second. Instead, the next
+// frame is rendered into a third PSRAM buffer (stagingCanvas, ping-pong) in
+// small slices in the gaps between sweep ticks, band-copied into the
+// inactive panel fb, swapped in with ONE atomic present, then mirrored into
+// the other fb in 4 more band slices.
+//
+// Sweep update modes, chosen by phase (this is what fixed the "jittery
+// sweep" report):
+//  - IDLE and RENDER phases (fill/static/trails/blips): the slices only
+//    touch the staging canvas, both panel fbs stay in sync, so the sweep
+//    uses the GOOD zero-copy path (erase+draw in the INACTIVE fb, then an
+//    O(1) present) — never visible mid-scan.
+//  - COPY/SWAP/SYNC phase: the two fbs temporarily differ, so presents
+//    would alternate content. The sweep is then drawn directly into the
+//    ACTIVE fb, but ONLY right after VSYNC (vblank, ~4ms window) — an
+//    arbitrary-timing active-fb erase+rewrite splits the line at the scan
+//    position, which was exactly the reported jitter.
 //
 // Sweep erase position is tracked PER FRAMEBUFFER (prevSweepX/Y[2]): the two
 // driver buffers alternate on every present, so each buffer must remember
-// where ITS OWN line was, or the erase misses and ghosts.
+// where ITS OWN line was, or the erase misses and ghosts. Erases RESTORE
+// background from bgFrame (the last completed staged frame, sweep-free) —
+// erasing to BLACK cut gashes through labels/trails.
 enum StageSlice : uint8_t {
   SL_IDLE = 0,
   SL_FILL_A, SL_FILL_B, SL_STATIC, SL_TRAILS_A, SL_TRAILS_B, SL_BLIPS,
@@ -1502,40 +1523,42 @@ void renderRadar(bool justEntered) {
   }
 
   bool tickDue = (now - lastSweep >= 30);
+  bool copyPhase = (slice >= SL_COPY_A);  // fbs differ here — no presents allowed
 
-  if (slice != SL_IDLE) {
-    // Staged cycle in progress: sweep keeps animating, drawn DIRECTLY into
-    // the active fb (no present — a 1px-line write mid-scan is invisible).
-    if (tickDue) {
-      lastSweep = now;
-      float sweepDeg = fmodf(millis() / (swpSec * 1000.0f / 360.0f), 360.0f);
-      double sw = deg2rad(sweepDeg);
-      int newX = L.cx + (int)(sin(sw) * L.R);
-      int newY = L.cy - (int)(cos(sw) * L.R);
-      uint8_t act = drawBufIdx ^ 1;
-      if (havePrevSweep[act]) restoreLine(panelFbs[act], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[act], prevSweepY[act]);
-      plotLine(panelFbs[act], L.cx, L.cy, newX, newY, cSweepCol);
-      prevSweepX[act] = newX; prevSweepY[act] = newY; havePrevSweep[act] = true;
-      return;
-    }
-    runStagingSlice(L);
-    return;
-  }
-
-  // Idle between cycles: zero-copy sweep tick (erase+draw in the inactive
-  // fb, then an O(1) present), or kick off a new staged cycle.
   if (tickDue) {
     lastSweep = now;
     float sweepDeg = fmodf(millis() / (swpSec * 1000.0f / 360.0f), 360.0f);
     double sw = deg2rad(sweepDeg);
     int newX = L.cx + (int)(sin(sw) * L.R);
     int newY = L.cy - (int)(cos(sw) * L.R);
-    if (havePrevSweep[drawBufIdx]) restoreLine(panelFbs[drawBufIdx], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx]);
-    plotLine(panelFbs[drawBufIdx], L.cx, L.cy, newX, newY, cSweepCol);
-    prevSweepX[drawBufIdx] = newX; prevSweepY[drawBufIdx] = newY; havePrevSweep[drawBufIdx] = true;
-    pushFrame();
+
+    if (!copyPhase) {
+      // Zero-copy tick (IDLE and render phases): erase+draw in the inactive
+      // fb, then an O(1) present. Never visible mid-scan.
+      if (havePrevSweep[drawBufIdx]) restoreLine(panelFbs[drawBufIdx], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx]);
+      plotLine(panelFbs[drawBufIdx], L.cx, L.cy, newX, newY, cSweepCol);
+      prevSweepX[drawBufIdx] = newX; prevSweepY[drawBufIdx] = newY; havePrevSweep[drawBufIdx] = true;
+      pushFrame();
+    } else {
+      // Copy/swap/sync phase: present would alternate content, so draw
+      // directly into the ACTIVE fb — but only right after VSYNC, so the
+      // write lands in the vblank gap and never splits the line mid-scan.
+      uint8_t act = drawBufIdx ^ 1;
+      uint32_t v0 = vsyncCount, tW = millis();
+      while (vsyncCount == v0 && millis() - tW < 60) { delay(1); }
+      if (havePrevSweep[act]) restoreLine(panelFbs[act], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[act], prevSweepY[act]);
+      plotLine(panelFbs[act], L.cx, L.cy, newX, newY, cSweepCol);
+      prevSweepX[act] = newX; prevSweepY[act] = newY; havePrevSweep[act] = true;
+    }
     return;
   }
+
+  if (slice != SL_IDLE) {
+    runStagingSlice(L);
+    return;
+  }
+
+  // Idle between cycles and no tick due: kick off a new staged cycle.
   if (now - lastFullCycle >= redrawMs) {
     stgRenderIdx ^= 1;  // ping-pong: render into the OTHER staging buffer, keeping the last complete frame valid as bgFrame
     gfx = stagingCanvas[stgRenderIdx];
