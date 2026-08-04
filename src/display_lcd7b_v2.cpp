@@ -1510,9 +1510,45 @@ enum StageSlice : uint8_t {
 };
 static StageSlice slice = SL_IDLE;
 static uint32_t lastFullCycle = 0;
-static int prevSweepX[2] = { RADAR_CX, RADAR_CX };
-static int prevSweepY[2] = { RADAR_CY - RADAR_R, RADAR_CY - RADAR_R };
-static bool havePrevSweep[2] = { false, false };
+
+// --- Phosphor afterglow state ---------------------------------------------
+// Instead of a single previous sweep position per fb, keep a short history
+// of recent endpoints per fb. Each tick restores the whole previous set
+// from bgFrame and redraws it dimmest-first behind the new line, giving a
+// CRT-phosphor fading trail. History length 1 degrades to the plain line.
+#define GLOW_MAX 12
+static int glowX[2][GLOW_MAX], glowY[2][GLOW_MAX];  // per-fb, [0] = newest
+static uint8_t glowCount[2] = {0, 0};
+
+static uint16_t dim565(uint16_t c, uint8_t num, uint8_t den) {
+  uint16_t r = ((c >> 11) & 0x1F) * num / den;
+  uint16_t g = ((c >> 5) & 0x3F) * num / den;
+  uint16_t b = (c & 0x1F) * num / den;
+  return (r << 11) | (g << 5) | b;
+}
+// Brightness per segment age (newest first), tenths — roughly exponential.
+static const uint8_t GLOW_FADE[GLOW_MAX] = { 10, 7, 5, 4, 3, 2, 2, 1, 1, 1, 1, 1 };
+
+// One sweep update for one framebuffer. Restores last tick's glow from the
+// background frame, shifts the new endpoint in, redraws dimmest-first so
+// the heavy center overlap ends up brightest.
+static void sweepGlowTick(uint8_t idx, int cx, int cy, int newX, int newY, uint16_t col, uint8_t K) {
+  uint16_t *fb = panelFbs[idx];
+  const uint16_t *bg = bgFrame->getFramebuffer();
+  for (uint8_t i = 0; i < glowCount[idx]; i++)
+    restoreLine(fb, bg, cx, cy, glowX[idx][i], glowY[idx][i]);
+  if (K > GLOW_MAX) K = GLOW_MAX;
+  if (K == 0) K = 1;
+  uint8_t n = glowCount[idx] < K ? glowCount[idx] : (uint8_t)(K - 1);
+  for (int i = n; i > 0; i--) { glowX[idx][i] = glowX[idx][i-1]; glowY[idx][i] = glowY[idx][i-1]; }
+  glowX[idx][0] = newX; glowY[idx][0] = newY;
+  if (glowCount[idx] < K) glowCount[idx]++;
+  for (int i = glowCount[idx] - 1; i >= 0; i--)
+    plotLine(fb, cx, cy, glowX[idx][i], glowY[idx][i], dim565(col, GLOW_FADE[i], 10));
+}
+static void sweepGlowSeed(uint8_t idx, int x, int y) {
+  glowX[idx][0] = x; glowY[idx][0] = y; glowCount[idx] = 1;
+}
 
 // Executes exactly one slice of the staged redraw and advances the state
 // machine. Called only when no sweep tick is due, so the sweep never waits
@@ -1580,9 +1616,7 @@ void runStagingSlice(const RadarLayout &L) {
       // sweep-line erases from here on.
       pushFrame();
       bgFrame = stagingCanvas[stgRenderIdx];
-      prevSweepX[drawBufIdx ^ 1] = drawnSweepX;
-      prevSweepY[drawBufIdx ^ 1] = drawnSweepY;
-      havePrevSweep[drawBufIdx ^ 1] = true;
+      sweepGlowSeed(drawBufIdx ^ 1, drawnSweepX, drawnSweepY);
       slice = SL_SYNC_A;
       break;
     case SL_SYNC_A: case SL_SYNC_B: case SL_SYNC_C: case SL_SYNC_D: {
@@ -1593,9 +1627,7 @@ void runStagingSlice(const RadarLayout &L) {
              (uint8_t *)stg->getFramebuffer() + (size_t)band * bandBytes,
              bandBytes);
       if (band == 3) {
-        prevSweepX[drawBufIdx] = drawnSweepX;
-        prevSweepY[drawBufIdx] = drawnSweepY;
-        havePrevSweep[drawBufIdx] = true;
+        sweepGlowSeed(drawBufIdx, drawnSweepX, drawnSweepY);
         slice = SL_IDLE;
         lastFullCycle = millis();
       } else {
@@ -1616,11 +1648,13 @@ void renderRadar(bool justEntered) {
   uint8_t cur = screen % LCD7B_NUM_SCREENS;
   const RadarLayout L = radarLayout(cur);
 
-  // The fast path needs these three config values without a full snapshot.
-  float swpSec; uint16_t cSweepCol, redrawMs;
+  // The fast path needs these config values without a full snapshot.
+  float swpSec; uint16_t cSweepCol, redrawMs; uint8_t glowK; bool glowOn;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
   swpSec = sweepPeriodSec; cSweepCol = colSweep; redrawMs = radarRedrawMs;
+  glowOn = sweepGlow; glowK = sweepGlowLen;
   if (configMutex) xSemaphoreGive(configMutex);
+  if (!glowOn) glowK = 1;
 
   // Screen switch: abandon any in-progress staging and do one immediate
   // monolithic redraw, so the new screen appears at once, fully correct.
@@ -1640,9 +1674,7 @@ void renderRadar(bool justEntered) {
     // Seed this buffer's erase position from the endpoint the screen
     // actually drew (recorded at draw time — NOT a fresh millis() here;
     // recomputing after the slow draw/push was the original ghosting bug).
-    prevSweepX[drawBufIdx] = drawnSweepX;
-    prevSweepY[drawBufIdx] = drawnSweepY;
-    havePrevSweep[drawBufIdx] = true;
+    sweepGlowSeed(drawBufIdx, drawnSweepX, drawnSweepY);
 
     pushFrame();
     uint32_t t3 = micros();
@@ -1653,9 +1685,7 @@ void renderRadar(bool justEntered) {
     // Keep the background-source frame in step with what's on screen, so
     // sweep-line erases restore the right pixels.
     memcpy(bgFrame->getFramebuffer(), panelFbs[drawBufIdx ^ 1], (size_t)LCD_W * LCD_H * sizeof(uint16_t));
-    prevSweepX[drawBufIdx] = drawnSweepX;
-    prevSweepY[drawBufIdx] = drawnSweepY;
-    havePrevSweep[drawBufIdx] = true;
+    sweepGlowSeed(drawBufIdx, drawnSweepX, drawnSweepY);
 
     lastFullCycle = now;
     lastSweep = now;
@@ -1673,11 +1703,9 @@ void renderRadar(bool justEntered) {
     int newY = L.cy - (int)(cos(sw) * L.R);
 
     if (!copyPhase) {
-      // Zero-copy tick (IDLE and render phases): erase+draw in the inactive
-      // fb, then an O(1) present. Never visible mid-scan.
-      if (havePrevSweep[drawBufIdx]) restoreLine(panelFbs[drawBufIdx], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx]);
-      plotLine(panelFbs[drawBufIdx], L.cx, L.cy, newX, newY, cSweepCol);
-      prevSweepX[drawBufIdx] = newX; prevSweepY[drawBufIdx] = newY; havePrevSweep[drawBufIdx] = true;
+      // Zero-copy tick (IDLE and render phases): afterglow update in the
+      // inactive fb, then an O(1) present. Never visible mid-scan.
+      sweepGlowTick(drawBufIdx, L.cx, L.cy, newX, newY, cSweepCol, glowK);
       pushFrame();
     } else {
       // Copy/swap/sync phase: present would alternate content, so draw
@@ -1686,9 +1714,7 @@ void renderRadar(bool justEntered) {
       uint8_t act = drawBufIdx ^ 1;
       uint32_t v0 = vsyncCount, tW = millis();
       while (vsyncCount == v0 && millis() - tW < 60) { delay(1); }
-      if (havePrevSweep[act]) restoreLine(panelFbs[act], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[act], prevSweepY[act]);
-      plotLine(panelFbs[act], L.cx, L.cy, newX, newY, cSweepCol);
-      prevSweepX[act] = newX; prevSweepY[act] = newY; havePrevSweep[act] = true;
+      sweepGlowTick(act, L.cx, L.cy, newX, newY, cSweepCol, glowK);
     }
     return;
   }

@@ -48,6 +48,8 @@ uint16_t fetchIntervalSec = UPDATE_INTERVAL_MS / 1000;
 bool     showAirports = true;
 bool     showTrailKey = true;
 bool     showCompass = true;
+bool     sweepGlow = true;
+uint8_t  sweepGlowLen = 6;
 uint16_t colSweep = 0x07E0;      // GREEN
 uint16_t colBlip = 0x07E0;       // GREEN
 uint16_t colBlipHi = 0xFFE0;     // YELLOW
@@ -749,7 +751,7 @@ void initWebServer() {
     bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy, showTr, preferTables;
     uint8_t maxB; uint16_t trailSamp, trailStale, cAlt, redrawMs, fetchSec;
     float swpSec, cNear; int16_t cVr;
-    bool sApt, sKey, sComp;
+    bool sApt, sKey, sComp, glowOn; uint8_t glowLen;
     uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors; bright = brightness;
@@ -759,6 +761,7 @@ void initWebServer() {
     cNear = classNearKm; cAlt = classMaxAltFt; cVr = classVrateFpm;
     swpSec = sweepPeriodSec; redrawMs = radarRedrawMs; fetchSec = fetchIntervalSec;
     sApt = showAirports; sKey = showTrailKey; sComp = showCompass;
+    glowOn = sweepGlow; glowLen = sweepGlowLen;
     cSweep = colSweep; cBlip = colBlip; cBlipHi = colBlipHi; cRings = colRings; cAirpt = colAirport;
     cTrDep = colTrailDep; cTrArr = colTrailArr; cTrOver = colTrailOver;
     if (configMutex) xSemaphoreGive(configMutex);
@@ -921,6 +924,15 @@ void initWebServer() {
     <input type="number" name="maxblips" id="maxblips" min="1" max="20" value=")rawliteral" + String(maxB) + R"rawliteral(">
     <label>Sweep revolution period (seconds)</label>
     <input type="number" step="0.1" name="swpsec" id="swpsec" min="1" max="60" value=")rawliteral" + String(swpSec, 1) + R"rawliteral(">
+    <div class="switch-row">
+      <label for="swpglow">Phosphor afterglow behind sweep</label>
+      <label class="switch">
+        <input type="checkbox" id="swpglow")rawliteral" + String(glowOn ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <label>Afterglow length (segments, 1-12)</label>
+    <input type="number" name="swpglowlen" id="swpglowlen" min="1" max="12" value=")rawliteral" + String(glowLen) + R"rawliteral(">
     <label>Full screen refresh interval (ms)</label>
     <input type="number" step="50" name="redrawms" id="redrawms" min="200" max="5000" value=")rawliteral" + String(redrawMs) + R"rawliteral(">
     <div class="color-row"><label>Sweep line</label><input type="color" name="c_sweep" id="c_sweep" value=")rawliteral" + rgb565ToHex(cSweep) + R"rawliteral("></div>
@@ -1123,6 +1135,8 @@ function save(e){
          '&showapt='+(document.getElementById('showapt').checked?'1':'0')+
          '&showcomp='+(document.getElementById('showcomp').checked?'1':'0')+
          '&showkey='+(document.getElementById('showkey').checked?'1':'0')+
+         '&swpglow='+(document.getElementById('swpglow').checked?'1':'0')+
+         '&swpglowlen='+encodeURIComponent(document.getElementById('swpglowlen').value)+
          '&fr_quiet='+(document.getElementById('fr_quiet').checked?'1':'0')+
          ruleArgs(0)+ruleArgs(1)+ruleArgs(2)+ruleArgs(3)+ruleArgs(4));
 }
@@ -1222,6 +1236,10 @@ function doOta(e){
       }
     }
     bool newQuiet = server.hasArg("fr_quiet") ? (server.arg("fr_quiet") == "1") : filterQuiet;
+    bool newGlowOn = server.hasArg("swpglow") ? (server.arg("swpglow") == "1") : sweepGlow;
+    uint8_t newGlowLen = server.hasArg("swpglowlen") ? (uint8_t)server.arg("swpglowlen").toInt() : sweepGlowLen;
+    if (newGlowLen < 1) newGlowLen = 1;
+    if (newGlowLen > 12) newGlowLen = 12;
 
     // WiFi network slots (optional). strncpy under configMutex since
     // wifiMaintain() reads the slots on Core 1; NVS writes stay outside.
@@ -1313,6 +1331,8 @@ function doOta(e){
     colTrailOver = newColTrOver;
     memcpy(filterRules, newRules, sizeof(filterRules));
     filterQuiet = newQuiet;
+    sweepGlow = newGlowOn;
+    sweepGlowLen = newGlowLen;
     if (configMutex) xSemaphoreGive(configMutex);
     applyInvertColors(newInvert);
     applyBrightness(newBrightness);
@@ -1368,6 +1388,8 @@ function doOta(e){
       prefs.putUShort(kc, newRules[i].color);
     }
     prefs.putBool("fr_quiet", newQuiet);
+    prefs.putBool("swpglow", newGlowOn);
+    prefs.putUChar("swpglowlen", newGlowLen);
 
     Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,

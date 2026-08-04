@@ -81,6 +81,8 @@ void setup() {
     filterRules[i].color = prefs.getUShort(kc, filterRules[i].color);
   }
   filterQuiet = prefs.getBool("fr_quiet", filterQuiet);
+  sweepGlow = prefs.getBool("swpglow", sweepGlow);
+  sweepGlowLen = prefs.getUChar("swpglowlen", sweepGlowLen);
   applyInvertColors(invertColors);
   applyBrightness(brightness);
   Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d bright=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",

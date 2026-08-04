@@ -58,6 +58,8 @@ extern uint16_t fetchIntervalSec;  // aircraft data poll interval
 extern bool     showAirports;
 extern bool     showTrailKey;
 extern bool     showCompass;
+extern bool     sweepGlow;         // phosphor afterglow behind the sweep
+extern uint8_t  sweepGlowLen;      // afterglow segments (1 = off, up to 12)
 extern uint16_t colSweep;
 extern uint16_t colBlip;           // blip color once the sweep has passed
 extern uint16_t colBlipHi;         // blip color just behind the sweep
