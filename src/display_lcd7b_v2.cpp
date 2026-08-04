@@ -1480,7 +1480,7 @@ void displaySetup() {
       "uptime_s: %lu\nreset_reason: %d\nheap_free: %u\nheap_min_free: %u\nheap_largest_block: %u\npsram_free: %u\n"
       "rssi_dbm: %d\nscreen: %u\nfill_us: %lu\ndraw_us: %lu\npush_us: %lu\nframe_interval_ms: %lu\n"
       "blips: %u\napi_ok: %lu\napi_fail: %lu\nfetch_stage: %u\nfetch_http: %d\nfetch_bytes: %lu\nfetch_head: %s\n"
-      "range_km: %.0f\ndata_age_ms: %lu\nstaged_slice: %d\nlast_cycle_age_ms: %lu\ndraw_buf: %u\nglow0: %u\n"
+      "top5: %u\nnearest_valid: %d\nnearest_cs: %s\nrange_km: %.0f\ndata_age_ms: %lu\nstaged_slice: %d\nlast_cycle_age_ms: %lu\ndraw_buf: %u\nglow0: %u\n"
       "touch_xy: %d,%d\ntouch_action: %s\n",
       (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (unsigned)ESP.getFreePsram(),
@@ -1490,6 +1490,7 @@ void displaySetup() {
       blipCount, (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail,
       (unsigned)stats.lastFetchStage, stats.lastHttpCode, (unsigned long)stats.lastPayloadBytes,
       stats.lastPayloadHead,
+      top5Count, (int)nearest.valid, nearest.callsign,
       radarMaxKm, (unsigned long)(millis() - lastDataMs),
       (int)slice, (unsigned long)(millis() - lastFullCycle), (unsigned)drawBufIdx, (unsigned)glowCount[0],
       (int)dbgTouchX, (int)dbgTouchY, dbgTouchAction);
