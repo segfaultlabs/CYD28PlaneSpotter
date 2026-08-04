@@ -89,6 +89,8 @@ void setup() {
   nightBrightPct = prefs.getUChar("nd_bright", nightBrightPct);
   autoCycleOn = prefs.getBool("acycle", autoCycleOn);
   autoCycleSec = prefs.getUShort("acyclesec", autoCycleSec);
+  showMap = prefs.getBool("showmap", showMap);
+  colMap = prefs.getUShort("c_map", colMap);
   applyInvertColors(invertColors);
   applyBrightness(brightness);
   Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d bright=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",

@@ -39,6 +39,7 @@
 #include "IOExtension.h"
 #include "GT911_touch.h"
 #include "qrcodegen.h"
+#include "map_outlines.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
 #include "esp_lcd_panel_vendor.h"
@@ -278,8 +279,7 @@ static void trailProject(TrailHistory &t, uint16_t idx, double hLat, double hLon
 // Appends one sample, keeping lat/lon and the polar cache in sync. Shift-on-
 // full uses memmove for all five arrays (the old per-element loop moved
 // 28.8KB by hand every append).
-static void trailAppend(TrailHistory &t, uint16_t cap, double hLat, double hLon, double blat, double blon) {
-  if (t.count < cap) {
+static void trailAppend(TrailHistory &t, uint16_t cap, double hLat, double hLon, double blat, double blon) {  if (t.count < cap) {
     t.lat[t.count] = blat; t.lon[t.count] = blon;
     trailProject(t, t.count, hLat, hLon);
     t.count++;
@@ -293,6 +293,15 @@ static void trailAppend(TrailHistory &t, uint16_t cap, double hLat, double hLon,
     trailProject(t, cap - 1, hLat, hLon);
   }
 }
+
+// --- Map underlay ----------------------------------------------------------
+// Vector coastlines (solid) + land borders (auto-dimmed) from the embedded
+// Natural Earth dataset in map_outlines.h. Points get the same polar-cache
+// treatment as trails: distance + bearing sin/cos computed once per home
+// location (mapProjectAll, rare), so the per-cycle draw is just scale+offset
+// per point. Polar cache: 8120 points x 12B = ~97KB PSRAM.
+static float *mapDist = nullptr, *mapSinB = nullptr, *mapCosB = nullptr;
+static double mapHomeLat = 1e9, mapHomeLon = 1e9;
 
 // Real double-buffered RGB panel, bypassing Arduino_GFX's RGB bus classes
 // entirely — confirmed by reading Arduino_ESP32RGBPanel's source directly
@@ -321,6 +330,7 @@ static uint8_t drawBufIdx = 0;
 enum StageSlice : uint8_t {
   SL_IDLE = 0,
   SL_FILL_A, SL_FILL_B, SL_FILL_C, SL_FILL_D,
+  SL_MAP,
   SL_STATIC,
   SL_TRAILS_A, SL_TRAILS_B, SL_TRAILS_C, SL_TRAILS_D,
   SL_BLIPS,
@@ -670,12 +680,12 @@ static void drawAirportMarker(int px, int py, uint16_t color) {
 }
 
 // On-screen key explaining the trace classification colors + airport
-// marker. Drawn only when showTraces is on (no traces, nothing to explain).
-static void drawTrailKey(int x, int y, uint16_t cDep, uint16_t cArr, uint16_t cOver, uint16_t cApt) {
-  const char *labels[4] = { "TAKEOFF", "LANDING", "FLYOVER", "AIRPORT" };
-  const uint16_t colors[4] = { cDep, cArr, cOver, cApt };
+// marker + map underlay. Drawn only when showTraces is on.
+static void drawTrailKey(int x, int y, uint16_t cDep, uint16_t cArr, uint16_t cOver, uint16_t cApt, uint16_t cMap) {
+  const char *labels[5] = { "TAKEOFF", "LANDING", "FLYOVER", "AIRPORT", "MAP" };
+  const uint16_t colors[5] = { cDep, cArr, cOver, cApt, cMap };
   gfx->setTextSize(2);
-  for (uint8_t i = 0; i < 4; i++) {
+  for (uint8_t i = 0; i < 5; i++) {
     if (i == 3) drawAirportMarker(x + 10, y + 8, colors[i]);
     else gfx->drawFastHLine(x, y + 8, 20, colors[i]);
     gfx->setTextColor(colors[i], BLACK);
@@ -861,8 +871,8 @@ struct RadarCfg {
   bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
   uint8_t maxBlips; uint16_t trailSamp, trailStale, cAlt, redrawMs;
   float swpSec, cNear; int16_t cVr;
-  bool sApt, sKey, sComp, quiet;
-  uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
+  bool sApt, sKey, sComp, quiet, sMap;
+  uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver, cMap;
   FilterRule rules[FILTER_MAX_RULES];
 };
 static RadarCfg radarCfgSnapshot() {
@@ -875,6 +885,7 @@ static RadarCfg radarCfgSnapshot() {
   c.cNear = classNearKm; c.cAlt = classMaxAltFt; c.cVr = classVrateFpm;
   c.swpSec = sweepPeriodSec; c.redrawMs = radarRedrawMs;
   c.sApt = showAirports; c.sKey = showTrailKey; c.sComp = showCompass;
+  c.sMap = showMap; c.cMap = colMap;
   c.cSweep = colSweep; c.cBlip = colBlip; c.cBlipHi = colBlipHi; c.cRings = colRings; c.cAirpt = colAirport;
   c.cTrDep = colTrailDep; c.cTrArr = colTrailArr; c.cTrOver = colTrailOver;
   c.quiet = filterQuiet;
@@ -892,6 +903,72 @@ static int filterMatchBlip(const Blip &b, const FilterRule *rules) {
   }
   return -1;
 }
+
+// --- Map underlay ----------------------------------------------------------
+// Vector coastlines (solid) + land borders (auto-dimmed) from the embedded
+// Natural Earth dataset in map_outlines.h. Points get the same polar-cache
+// treatment as trails: distance + bearing sin/cos computed once per home
+// location (mapProjectAll, rare), so the per-cycle draw is just scale+offset
+// per point. Polar cache: 8120 points x 12B = ~97KB PSRAM.
+static void mapProjectAll(double hLat, double hLon) {
+  if (!mapDist) {
+    mapDist = (float *)ps_malloc(sizeof(float) * MAP_OUTLINES_POINTS);
+    mapSinB = (float *)ps_malloc(sizeof(float) * MAP_OUTLINES_POINTS);
+    mapCosB = (float *)ps_malloc(sizeof(float) * MAP_OUTLINES_POINTS);
+    if (!mapDist || !mapSinB || !mapCosB) return;
+  }
+  uint16_t pi = 0;
+  for (int32_t i = 0; i < MAP_OUTLINES_LEN && pi < MAP_OUTLINES_POINTS;) {
+    int16_t n = MAP_OUTLINES[i];
+    int c = n < 0 ? -n : n;
+    i++;
+    for (int j = 0; j < c && pi < MAP_OUTLINES_POINTS; j++, pi++, i += 2) {
+      float dist, brg;
+      trailPolar((float)hLat, (float)hLon,
+                 MAP_OUTLINES[i] / 100.0f, MAP_OUTLINES[i + 1] / 100.0f, dist, brg);
+      float br = brg * (float)PI / 180.0f;
+      mapDist[pi] = dist;
+      mapSinB[pi] = sinf(br);
+      mapCosB[pi] = cosf(br);
+    }
+  }
+  mapHomeLat = hLat;
+  mapHomeLon = hLon;
+}
+
+static void drawMapOutline(const RadarLayout &L, const RadarCfg &cfg);
+
+// Channel-scale an RGB565 color (used for afterglow fades and border-dimmed
+// map lines).
+static uint16_t dim565(uint16_t c, uint8_t num, uint8_t den) {
+  uint16_t r = ((c >> 11) & 0x1F) * num / den;
+  uint16_t g = ((c >> 5) & 0x3F) * num / den;
+  uint16_t b = (c & 0x1F) * num / den;
+  return (r << 11) | (g << 5) | b;
+}
+
+static void drawMapOutline(const RadarLayout &L, const RadarCfg &cfg) {
+  const int cx = L.cx, cy = L.cy, R = L.R;
+  const uint16_t borderC = dim565(cfg.cMap, 1, 2);
+  uint16_t pi = 0;
+  for (int32_t i = 0; i < MAP_OUTLINES_LEN && pi < MAP_OUTLINES_POINTS;) {
+    int16_t n = MAP_OUTLINES[i];
+    bool border = n < 0;
+    int c = border ? -n : n;
+    i++;
+    uint16_t color = border ? borderC : cfg.cMap;
+    int prevX = 0, prevY = 0; bool havePrev = false;
+    for (int j = 0; j < c && pi < MAP_OUTLINES_POINTS; j++, pi++, i += 2) {
+      float fr = mapDist[pi] / cfg.rMax;
+      if (fr > 1.05f) { havePrev = false; continue; }
+      int rr = (int)(fr * R);
+      int px = cx + (int)(mapSinB[pi] * rr);
+      int py = cy - (int)(mapCosB[pi] * rr);
+      if (havePrev) gfx->drawLine(prevX, prevY, px, py, color);
+      prevX = px; prevY = py; havePrev = true;
+    }
+  }
+}
 void drawRadarFurniture(const RadarLayout &L, const RadarCfg &cfg);
 void drawRadarStatic(const RadarLayout &L, const RadarCfg &cfg);
 void drawRadarTrails(const RadarLayout &L, const RadarCfg &cfg, uint8_t slotFrom, uint8_t slotTo);
@@ -900,6 +977,10 @@ void drawRadarBlips(const RadarLayout &L, const RadarCfg &cfg);
 // Full radar frame, used by the monolithic redraw path (screen entry).
 void drawRadarAll(const RadarLayout &L) {
   RadarCfg cfg = radarCfgSnapshot();
+  if (cfg.sMap) {
+    if (mapHomeLat != cfg.hLat || mapHomeLon != cfg.hLon) mapProjectAll(cfg.hLat, cfg.hLon);
+    drawMapOutline(L, cfg);
+  }
   drawRadarFurniture(L, cfg);
   drawRadarStatic(L, cfg);
   drawRadarTrails(L, cfg, 0, TRAIL_SLOTS);
@@ -1234,8 +1315,8 @@ void drawRadarTrails(const RadarLayout &L, const RadarCfg &cfg, uint8_t slotFrom
   }
   // Key sits in the corner of the radar area, clear of the circle.
   if (slotTo >= TRAIL_SLOTS && cfg.sKey)
-    drawTrailKey(L.full ? 830 : 870, L.full ? 420 : 460,
-                 cfg.cTrDep, cfg.cTrArr, cfg.cTrOver, cfg.cAirpt);
+    drawTrailKey(L.full ? 830 : 870, L.full ? 400 : 440,
+                 cfg.cTrDep, cfg.cTrArr, cfg.cTrOver, cfg.cAirpt, cfg.cMap);
 }
 
 // Blips (projected positions) + their collision-avoided labels, with the
@@ -1620,12 +1701,7 @@ void displayPanelSync() {
 // tick restores the whole previous endpoint set from bgFrame and redraws it
 // dimmest-first behind the new line — a CRT-style fading trail. History
 // length 1 degrades to the plain line.
-static uint16_t dim565(uint16_t c, uint8_t num, uint8_t den) {
-  uint16_t r = ((c >> 11) & 0x1F) * num / den;
-  uint16_t g = ((c >> 5) & 0x3F) * num / den;
-  uint16_t b = (c & 0x1F) * num / den;
-  return (r << 11) | (g << 5) | b;
-}
+
 // Brightness per segment age (newest first), tenths — roughly exponential.
 static const uint8_t GLOW_FADE[GLOW_MAX] = { 10, 7, 5, 4, 3, 2, 2, 1, 1, 1, 1, 1 };
 
@@ -1665,7 +1741,20 @@ void runStagingSlice(const RadarLayout &L) {
       int band = slice - SL_FILL_A;
       const size_t q = (size_t)LCD_W * LCD_H / 4 * sizeof(uint16_t);
       memset((uint8_t *)stg->getFramebuffer() + (size_t)band * q, 0, q);
-      slice = (band == 3) ? SL_STATIC : (StageSlice)(slice + 1);
+      slice = (band == 3) ? SL_MAP : (StageSlice)(slice + 1);
+      break;
+    }
+    case SL_MAP: {
+      RadarCfg cfg = radarCfgSnapshot();
+      if (!cfg.sMap) { slice = SL_STATIC; break; }
+      if (mapHomeLat != cfg.hLat || mapHomeLon != cfg.hLon) {
+        // Home moved: reproject all 8120 points once (~50ms, rare), draw
+        // next call.
+        mapProjectAll(cfg.hLat, cfg.hLon);
+        break;  // slice stays SL_MAP
+      }
+      drawMapOutline(L, cfg);
+      slice = SL_STATIC;
       break;
     }
     case SL_STATIC: {

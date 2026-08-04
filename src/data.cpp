@@ -70,6 +70,8 @@ bool     sweepGlow = true;
 uint8_t  sweepGlowLen = 6;
 bool     autoCycleOn = true;
 uint16_t autoCycleSec = 5;
+bool     showMap = true;
+uint16_t colMap = 0x4A69;          // muted slate blue (RGB565)
 bool     nightDimOn = false;
 uint8_t  nightStartHr = 22;
 uint8_t  nightEndHr = 7;
@@ -213,6 +215,8 @@ static void configPersistAll() {
   prefs.putUChar("nd_bright", nightBrightPct);
   prefs.putBool("acycle", autoCycleOn);
   prefs.putUShort("acyclesec", autoCycleSec);
+  prefs.putBool("showmap", showMap);
+  prefs.putUShort("c_map", colMap);
   prefs.putBool("fr_quiet", filterQuiet);
   for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
     char ken[9], km[8], kt[8], ka[8], kc[8];
@@ -966,6 +970,7 @@ void initWebServer() {
     bool sApt, sKey, sComp, glowOn; uint8_t glowLen;
     bool ndOn; uint8_t ndStart, ndEnd, ndBright;
     bool aCycOn; uint16_t aCycSec;
+    bool sMap; uint16_t cMapCol;
     uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors; bright = brightness;
@@ -980,6 +985,7 @@ void initWebServer() {
     aCycOn = autoCycleOn; aCycSec = autoCycleSec;
     cSweep = colSweep; cBlip = colBlip; cBlipHi = colBlipHi; cRings = colRings; cAirpt = colAirport;
     cTrDep = colTrailDep; cTrArr = colTrailArr; cTrOver = colTrailOver;
+    sMap = showMap; cMapCol = colMap;
     if (configMutex) xSemaphoreGive(configMutex);
 
     String html = R"rawliteral(
@@ -1171,6 +1177,14 @@ void initWebServer() {
     <div class="color-row"><label>Plane (just behind sweep)</label><input type="color" name="c_bliphi" id="c_bliphi" value=")rawliteral" + rgb565ToHex(cBlipHi) + R"rawliteral("></div>
     <div class="color-row"><label>Range rings &amp; axes</label><input type="color" name="c_rings" id="c_rings" value=")rawliteral" + rgb565ToHex(cRings) + R"rawliteral("></div>
     <div class="color-row"><label>Airports</label><input type="color" name="c_airpt" id="c_airpt" value=")rawliteral" + rgb565ToHex(cAirpt) + R"rawliteral("></div>
+    <div class="color-row"><label>Map outlines (coast solid, border dim)</label><input type="color" name="c_map" id="c_map" value=")rawliteral" + rgb565ToHex(cMapCol) + R"rawliteral("></div>
+    <div class="switch-row">
+      <label for="showmap">Show map outlines</label>
+      <label class="switch">
+        <input type="checkbox" id="showmap")rawliteral" + String(sMap ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
     <div class="switch-row">
       <label for="showapt">Show airports on radar</label>
       <label class="switch">
@@ -1426,6 +1440,8 @@ function save(e){
          '&nd_bright='+encodeURIComponent(document.getElementById('nd_bright').value)+
          '&acycle='+(document.getElementById('acycle').checked?'1':'0')+
          '&acyclesec='+encodeURIComponent(document.getElementById('acyclesec').value)+
+         '&showmap='+(document.getElementById('showmap').checked?'1':'0')+
+         '&c_map='+encodeURIComponent(document.getElementById('c_map').value)+
          '&fr_quiet='+(document.getElementById('fr_quiet').checked?'1':'0')+
          ruleArgs(0)+ruleArgs(1)+ruleArgs(2)+ruleArgs(3)+ruleArgs(4));
 }
@@ -1540,6 +1556,8 @@ function doReboot(){
     uint16_t newACycSec = server.hasArg("acyclesec") ? (uint16_t)server.arg("acyclesec").toInt() : autoCycleSec;
     if (newACycSec < 2) newACycSec = 2;
     if (newACycSec > 300) newACycSec = 300;
+    bool newShowMap = server.hasArg("showmap") ? (server.arg("showmap") == "1") : showMap;
+    uint16_t newColMap = server.hasArg("c_map") ? hexToRgb565(server.arg("c_map")) : colMap;
     bool newNdOn = server.hasArg("nd_on") ? (server.arg("nd_on") == "1") : nightDimOn;
     uint8_t newNdStart = server.hasArg("nd_start") ? (uint8_t)server.arg("nd_start").toInt() : nightStartHr;
     uint8_t newNdEnd = server.hasArg("nd_end") ? (uint8_t)server.arg("nd_end").toInt() : nightEndHr;
@@ -1641,6 +1659,8 @@ function doReboot(){
     sweepGlowLen = newGlowLen;
     autoCycleOn = newACycOn;
     autoCycleSec = newACycSec;
+    showMap = newShowMap;
+    colMap = newColMap;
     nightDimOn = newNdOn;
     nightStartHr = newNdStart;
     nightEndHr = newNdEnd;

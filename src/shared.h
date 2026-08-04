@@ -66,6 +66,11 @@ extern uint8_t  sweepGlowLen;      // afterglow segments (1 = off, up to 12)
 extern bool     autoCycleOn;       // default on
 extern uint16_t autoCycleSec;      // seconds per screen (default 5)
 
+// Map underlay: vector coastlines (solid) + land borders (dimmer) from an
+// embedded Natural Earth dataset (see map_outlines.h).
+extern bool     showMap;           // default on
+extern uint16_t colMap;            // coastline color (borders auto-dimmed)
+
 // Day/night cycle: the weather widget shows sun by day / moon by night
 // (fixed 07:00-19:00 day), and the backlight can auto-dim on a schedule.
 extern bool     nightDimOn;
