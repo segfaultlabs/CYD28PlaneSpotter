@@ -839,3 +839,7 @@ void checkTouch() {
   // Default: cycle to next screen
   screen = (screen + 1) % LCD7B_NUM_SCREENS;
 }
+
+// displayPanelSync is only meaningful on the RGB-parallel LCD-7B boards
+// (driver restart after flash-write bursts); these panels need nothing.
+void displayPanelSync() {}

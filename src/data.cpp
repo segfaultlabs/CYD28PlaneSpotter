@@ -147,21 +147,93 @@ void wifiLoadNetworks() {
   }
 }
 
-// Deferred NVS persistence for high-frequency config changes (the zoom
-// buttons). Writing NVS means a flash erase/write with the CPU cache
-// disabled, and on the LCD-7B v2 build the RGB driver's bounce-buffer
-// refill ISR is not IRAM-safe — an NVS write in the touch path visibly
-// glitches/desyncs the panel. So interactive code marks the value dirty
-// here, and configMaintain() (called from loop(), when the user has
-// stopped pressing buttons for 3s) does the actual write once.
+// Deferred NVS persistence for config writes. Writing NVS means flash
+// erase/write with the CPU cache disabled, and on the LCD-7B v2 build the
+// RGB driver's bounce-buffer refill ISR is not IRAM-safe — an NVS write in
+// the interactive path visibly glitches/desyncs the panel, and the ~50
+// synchronous writes a /save used to do could starve the idle task into a
+// watchdog reboot mid-save (which is why a save could "glitch the UI and
+// not come back", and why a location save might not land). Interactive
+// code now only marks things dirty; configMaintain() (loop(), after 2s of
+// idle) does the actual writes once, then hard-resyncs the display driver.
 static volatile bool rangeDirty = false;
 static uint32_t rangeDirtyMs = 0;
+volatile bool configDirty = false;
+static uint32_t configDirtyMs = 0;
 void markRangeDirty() {
   rangeDirty = true;
   rangeDirtyMs = millis();
 }
+
+// Writes every persisted config key. Called only from configMaintain().
+static void configPersistAll() {
+  prefs.putDouble("lat", homeLat);
+  prefs.putDouble("lon", homeLon);
+  prefs.putFloat("range", radarMaxKm);
+  prefs.putBool("invert", invertColors);
+  prefs.putUChar("bright", brightness);
+  prefs.putBool("callsign", showCallsign);
+  prefs.putBool("airline", showAirline);
+  prefs.putBool("speed", showSpeed);
+  prefs.putBool("fl", showFL);
+  prefs.putBool("route", showRoute);
+  prefs.putBool("reg", showReg);
+  prefs.putBool("squawk", showSquawk);
+  prefs.putBool("vrate", showVRate);
+  prefs.putBool("type", showType);
+  prefs.putBool("traces", showTraces);
+  prefs.putBool("tables", preferLocalTables);
+  prefs.putUChar("maxblips", maxBlipsShown);
+  prefs.putFloat("swpsec", sweepPeriodSec);
+  prefs.putUShort("redrawms", radarRedrawMs);
+  prefs.putUShort("fetchsec", fetchIntervalSec);
+  prefs.putUShort("trailsamp", trailMaxSamples);
+  prefs.putUShort("trailstale", trailStaleSec);
+  prefs.putFloat("cnearkm", classNearKm);
+  prefs.putUShort("cmaxalt", classMaxAltFt);
+  prefs.putShort("cvrate", classVrateFpm);
+  prefs.putBool("showapt", showAirports);
+  prefs.putBool("showkey", showTrailKey);
+  prefs.putBool("showcomp", showCompass);
+  prefs.putUShort("c_sweep", colSweep);
+  prefs.putUShort("c_blip", colBlip);
+  prefs.putUShort("c_bliphi", colBlipHi);
+  prefs.putUShort("c_rings", colRings);
+  prefs.putUShort("c_airpt", colAirport);
+  prefs.putUShort("c_trdep", colTrailDep);
+  prefs.putUShort("c_trarr", colTrailArr);
+  prefs.putUShort("c_trover", colTrailOver);
+  prefs.putBool("swpglow", sweepGlow);
+  prefs.putUChar("swpglowlen", sweepGlowLen);
+  prefs.putBool("nd_on", nightDimOn);
+  prefs.putUChar("nd_start", nightStartHr);
+  prefs.putUChar("nd_end", nightEndHr);
+  prefs.putUChar("nd_bright", nightBrightPct);
+  prefs.putBool("fr_quiet", filterQuiet);
+  for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
+    char ken[9], km[8], kt[8], ka[8], kc[8];
+    snprintf(ken, sizeof(ken), "fr_en%d", i);
+    snprintf(km, sizeof(km), "fr_m%d", i);
+    snprintf(kt, sizeof(kt), "fr_t%d", i);
+    snprintf(ka, sizeof(ka), "fr_a%d", i);
+    snprintf(kc, sizeof(kc), "fr_c%d", i);
+    prefs.putBool(ken, filterRules[i].enabled);
+    prefs.putUChar(km, filterRules[i].match);
+    prefs.putString(kt, filterRules[i].text);
+    prefs.putUChar(ka, filterRules[i].action);
+    prefs.putUShort(kc, filterRules[i].color);
+  }
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    char ks[10], kp[10];
+    snprintf(ks, sizeof(ks), "wssid%d", i);
+    snprintf(kp, sizeof(kp), "wpass%d", i);
+    prefs.putString(ks, wifiNets[i].ssid);
+    prefs.putString(kp, wifiNets[i].pass);
+  }
+}
+
 void configMaintain() {
-  if (rangeDirty && millis() - rangeDirtyMs > 3000) {
+  if (rangeDirty && millis() - rangeDirtyMs > 2000) {
     rangeDirty = false;
     float r;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
@@ -169,6 +241,13 @@ void configMaintain() {
     if (configMutex) xSemaphoreGive(configMutex);
     prefs.putFloat("range", r);
     Serial.printf("[cfg] range %.0f km persisted (deferred)\n", r);
+    displayPanelSync();
+  }
+  if (configDirty && millis() - configDirtyMs > 2000) {
+    configDirty = false;
+    configPersistAll();
+    Serial.println("[cfg] full config persisted (deferred)");
+    displayPanelSync();
   }
 }
 
@@ -1185,6 +1264,7 @@ void initWebServer() {
     <button type="submit">Upload &amp; Flash</button>
   </form>
   <div id="otaMsg" style="text-align:center;margin-top:8px;font-size:0.85em;color:#aaa"></div>
+  <button type="button" onclick="doReboot()" style="background:#5a2a2a;color:#e0e0e0">Reboot Device</button>
 </div>
 <div class="info">IP: )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
@@ -1358,6 +1438,13 @@ function doOta(e){
   x.send(fd);
   return false;
 }
+function doReboot(){
+  if(!confirm('Reboot the device now?')) return;
+  var x=new XMLHttpRequest();
+  x.open('POST','/reboot',true);
+  document.getElementById('otaMsg').textContent='Rebooting...';
+  x.send();
+}
 </script></body></html>)rawliteral";
 
     server.send(200, "text/html", html);
@@ -1450,8 +1537,6 @@ function doOta(e){
         strncpy(wifiNets[i].ssid, s.c_str(), 32); wifiNets[i].ssid[32] = '\0';
         strncpy(wifiNets[i].pass, p.c_str(), 64); wifiNets[i].pass[64] = '\0';
         if (configMutex) xSemaphoreGive(configMutex);
-        prefs.putString(ks, s);
-        prefs.putString(kp, p);
       }
     }
 
@@ -1529,59 +1614,14 @@ function doOta(e){
     applyInvertColors(newInvert);
     applyBrightness(newBrightness);
 
-    // Persist to NVS
-    prefs.putDouble("lat", newLat);
-    prefs.putDouble("lon", newLon);
-    prefs.putFloat("range", newRng);
-    prefs.putBool("invert", newInvert);
-    prefs.putUChar("bright", newBrightness);
-    prefs.putBool("callsign", newShowCallsign);
-    prefs.putBool("airline", newShowAirline);
-    prefs.putBool("speed", newShowSpeed);
-    prefs.putBool("fl", newShowFL);
-    prefs.putBool("route", newShowRoute);
-    prefs.putBool("reg", newShowReg);
-    prefs.putBool("squawk", newShowSquawk);
-    prefs.putBool("vrate", newShowVRate);
-    prefs.putBool("type", newShowType);
-    prefs.putBool("traces", newShowTraces);
-    prefs.putBool("tables", newPreferTables);
-    prefs.putUChar("maxblips", newMaxBlips);
-    prefs.putFloat("swpsec", newSwpSec);
-    prefs.putUShort("redrawms", newRedrawMs);
-    prefs.putUShort("fetchsec", newFetchSec);
-    prefs.putUShort("trailsamp", newTrailSamp);
-    prefs.putUShort("trailstale", newTrailStale);
-    prefs.putFloat("cnearkm", newCNear);
-    prefs.putUShort("cmaxalt", newCAlt);
-    prefs.putShort("cvrate", newCVr);
-    prefs.putBool("showapt", newShowApt);
-    prefs.putBool("showkey", newShowKey);
-    prefs.putBool("showcomp", newShowComp);
-    prefs.putUShort("c_sweep", newColSweep);
-    prefs.putUShort("c_blip", newColBlip);
-    prefs.putUShort("c_bliphi", newColBlipHi);
-    prefs.putUShort("c_rings", newColRings);
-    prefs.putUShort("c_airpt", newColAirpt);
-    prefs.putUShort("c_trdep", newColTrDep);
-    prefs.putUShort("c_trarr", newColTrArr);
-    prefs.putUShort("c_trover", newColTrOver);
-    for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
-      char ken[9], km[8], kt[8], ka[8], kc[8];
-      snprintf(ken, sizeof(ken), "fr_en%d", i);
-      snprintf(km, sizeof(km), "fr_m%d", i);
-      snprintf(kt, sizeof(kt), "fr_t%d", i);
-      snprintf(ka, sizeof(ka), "fr_a%d", i);
-      snprintf(kc, sizeof(kc), "fr_c%d", i);
-      prefs.putBool(ken, newRules[i].enabled);
-      prefs.putUChar(km, newRules[i].match);
-      prefs.putString(kt, newRules[i].text);
-      prefs.putUChar(ka, newRules[i].action);
-      prefs.putUShort(kc, newRules[i].color);
-    }
-    prefs.putBool("fr_quiet", newQuiet);
-    prefs.putBool("swpglow", newGlowOn);
-    prefs.putUChar("swpglowlen", newGlowLen);
+    // Persist DEFERRED — dozens of synchronous NVS writes here (flash
+    // erase/writes with the CPU cache off) glitched the panel's non-
+    // IRAM-safe LCD ISR and could watchdog-reboot the device mid-save,
+    // which is why a save could "glitch the UI and not come back" and why
+    // a location save might not land. configMaintain() persists everything
+    // after 2s idle, then resyncs the display.
+    configDirty = true;
+    configDirtyMs = millis();
 
     Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,
@@ -1591,6 +1631,13 @@ function doOta(e){
       WiFi.disconnect(false);  // wifiMaintain() picks it up within seconds
     }
     server.send(200, "text/plain", "OK");
+  });
+
+  // POST /reboot — remote restart (confirm dialog on the page is the only guard)
+  server.on("/reboot", HTTP_POST, []() {
+    server.send(200, "text/plain", "Rebooting...");
+    delay(500);
+    ESP.restart();
   });
 
   // POST /update — OTA firmware upload (multipart file upload). This flashes

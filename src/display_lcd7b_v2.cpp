@@ -1581,6 +1581,13 @@ void applyBrightness(uint8_t percent) {
   ioExpander.setBacklight(percent);
 }
 
+// Hard resync after NVS/flash-write bursts: force the RGB driver's DMA to
+// restart, recovering deterministically from any cache-off-induced underrun
+// instead of hoping the vsync self-recovery notices (it often doesn't).
+void displayPanelSync() {
+  if (panelHandle) esp_lcd_rgb_panel_restart(panelHandle);
+}
+
 // --- Staged (scheduled) radar redraw -------------------------------------
 // A monolithic full redraw costs ~200-300ms (fill + trails/blips + present
 // + back-buffer sync) and used to run as one blocking burst every

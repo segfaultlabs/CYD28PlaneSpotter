@@ -833,3 +833,7 @@ void applyBrightness(uint8_t percent) {
   }
   ledcWrite(BL_LEDC_CHANNEL, (uint32_t)percent * 255 / 100);
 }
+
+// displayPanelSync is only meaningful on the RGB-parallel LCD-7B boards
+// (driver restart after flash-write bursts); these panels need nothing.
+void displayPanelSync() {}

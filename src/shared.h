@@ -227,7 +227,8 @@ void connectWiFi();  // boot-time connect: tries all saved networks, starts fall
 void wifiLoadNetworks();  // load NVS network slots (seed slot 0 from config.env) — call after prefs.begin
 void wifiMaintain();   // non-blocking reconnect/AP-fallback state machine — call every loop()
 void markRangeDirty();  // defer NVS persistence of radarMaxKm (see configMaintain)
-void configMaintain();  // commits deferred config writes after 3s idle — call every loop()
+void configMaintain();  // commits deferred config writes after idle — call every loop()
+extern volatile bool configDirty;  // set by /save — full config persistence is deferred
 bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bool allowFetch = true);
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut);
@@ -246,5 +247,6 @@ void displaySetup();               // touch/display/sprite/canvas init + splash 
 void connectWiFiShow();            // shows a "connecting" indicator, calls connectWiFi(), clears after
 void applyInvertColors(bool invert);
 void applyBrightness(uint8_t percent);  // 0-100
+void displayPanelSync();           // hard display resync after flash-write bursts (RGB panels: driver restart; others: no-op)
 void render();
 void checkTouch();
