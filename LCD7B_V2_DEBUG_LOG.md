@@ -223,7 +223,8 @@ design was wrong at this duty cycle. Fix, two parts:
    esp_lcd_panel_rgb.c @ v5.5.5); direct draws wait for vblank (~4ms
    window) so the erase+rewrite completes before the scan reaches the
    line's pixels — no more mid-scan splits.
-**Status: kept, verified on hardware (user-confirmed).**
+**Status: kept, built and flashed; awaiting user confirmation that the
+jitter is visibly gone.**
 
 ### 18. Core performance pass (web→Core0, trail polar cache, memset fills) + sweep-artifact fix
 Deep-dive research (Espressif docs/FAQ, esp_lcd v5.5.5 driver source,
