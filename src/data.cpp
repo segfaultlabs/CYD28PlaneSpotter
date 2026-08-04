@@ -90,10 +90,114 @@ bool firstWeatherDone = false;
 // ---------------------------------------------------------------------------
 // Network & APIs
 // ---------------------------------------------------------------------------
-void connectWiFi() {
+WifiNet wifiNets[WIFI_MAX_NETWORKS];
+bool wifiApFallbackActive = false;
+
+// Loads the NVS network slots. Slot 0 is seeded from config.env's
+// WIFI_SSID/WIFI_PASS if it has never been set, so existing installs keep
+// working unchanged.
+void wifiLoadNetworks() {
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    char ks[10], kp[10];
+    snprintf(ks, sizeof(ks), "wssid%d", i);
+    snprintf(kp, sizeof(kp), "wpass%d", i);
+    String s = prefs.getString(ks, "");
+    String p = prefs.getString(kp, "");
+    if (i == 0 && s.length() == 0) {
+      s = WIFI_SSID; p = WIFI_PASS;
+      prefs.putString(ks, s); prefs.putString(kp, p);
+    }
+    strncpy(wifiNets[i].ssid, s.c_str(), 32); wifiNets[i].ssid[32] = '\0';
+    strncpy(wifiNets[i].pass, p.c_str(), 64); wifiNets[i].pass[64] = '\0';
+  }
+}
+
+static bool trySlot(uint8_t slot, uint32_t timeoutMs) {
+  if (!wifiNets[slot].ssid[0]) return false;
+  Serial.printf("[wifi] trying '%s'...\n", wifiNets[slot].ssid);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) { delay(400); }
+  WiFi.begin(wifiNets[slot].ssid, wifiNets[slot].pass);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) delay(250);
+  bool ok = WiFi.status() == WL_CONNECTED;
+  Serial.printf("[wifi] '%s': %s\n", wifiNets[slot].ssid, ok ? "connected" : "timeout");
+  return ok;
+}
+
+static void startFallbackAp() {
+  if (wifiApFallbackActive) return;
+  Serial.println("[wifi] no saved network reachable — starting setup AP 'PlaneSpotter-Setup'");
+  WiFi.mode(WIFI_AP_STA);  // AP stays up for the config page while STA retries continue
+  WiFi.softAP("PlaneSpotter-Setup");
+  wifiApFallbackActive = true;
+}
+
+// Boot-time connect: two full rounds over all saved networks, then the
+// fallback setup AP. Returns whenever connected (or after AP start) — never
+// blocks forever, so boot always completes.
+void connectWiFi() {
+  for (uint8_t round = 0; round < 2 && WiFi.status() != WL_CONNECTED; round++) {
+    for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+      if (trySlot(i, 8000)) {
+        Serial.printf("[wifi] connected, IP=%s\n", WiFi.localIP().toString().c_str());
+        return;
+      }
+    }
+  }
+  startFallbackAp();
+}
+
+// Non-blocking WiFi maintenance, called every loop() iteration. Keeps the
+// radar running on stale data during outages instead of freezing the UI on a
+// blocking reconnect. Round-robins saved networks with backoff; after two
+// full failed cycles starts the setup AP (WIFI_AP_STA, so the config page is
+// reachable at 192.168.4.1 while retries continue in the background).
+void wifiMaintain() {
+  enum : uint8_t { WS_OK, WS_CONNECTING, WS_WAIT };
+  static uint8_t state = WS_OK;
+  static uint8_t slot = 0;
+  static uint32_t t = 0;
+  static uint8_t failRounds = 0;
+  uint32_t now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (state != WS_OK) {
+      state = WS_OK; failRounds = 0;
+      Serial.printf("[wifi] connected, IP=%s\n", WiFi.localIP().toString().c_str());
+    }
+    if (wifiApFallbackActive) {  // back online: tear down the setup AP
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      wifiApFallbackActive = false;
+      Serial.println("[wifi] setup AP stopped");
+    }
+    return;
+  }
+
+  switch (state) {
+    case WS_OK:  // just lost the connection
+      state = WS_WAIT; t = now;
+      break;
+    case WS_WAIT:
+      if (now - t < 3000) break;
+      for (uint8_t k = 0; k < WIFI_MAX_NETWORKS; k++) {  // next configured slot
+        if (wifiNets[slot].ssid[0]) break;
+        slot = (slot + 1) % WIFI_MAX_NETWORKS;
+      }
+      if (!wifiNets[slot].ssid[0]) { startFallbackAp(); state = WS_WAIT; t = now; break; }
+      WiFi.disconnect(false);
+      WiFi.mode(wifiApFallbackActive ? WIFI_AP_STA : WIFI_STA);
+      WiFi.begin(wifiNets[slot].ssid, wifiNets[slot].pass);
+      Serial.printf("[wifi] reconnect: trying '%s'\n", wifiNets[slot].ssid);
+      state = WS_CONNECTING; t = now;
+      break;
+    case WS_CONNECTING:
+      if (now - t < 7000) break;
+      slot = (slot + 1) % WIFI_MAX_NETWORKS;
+      if (++failRounds >= 2) startFallbackAp();
+      state = WS_WAIT; t = now;
+      break;
+  }
 }
 
 // adsbdb.com's /v0/callsign/{callsign} returns airline name + both airport IATA
@@ -689,6 +793,21 @@ void initWebServer() {
 <h1>&#9992; CYD Plane Spotter</h1>
 <div class="card">
   <form id="cfg" onsubmit="save(event)">
+    <div class="section-hd" style="border-top:none;padding-top:0;margin-top:0">WiFi Networks</div>
+    <div class="note">Up to 4 saved networks, tried in order. If none are reachable the device starts its own "PlaneSpotter-Setup" AP &mdash; connect to it and open 192.168.4.1 to fix settings.</div>
+    <label>Network 1 SSID / Password</label>
+    <input type="text" name="wssid0" id="wssid0" maxlength="32" value=")rawliteral" + String(wifiNets[0].ssid) + R"rawliteral(">
+    <input type="text" name="wpass0" id="wpass0" maxlength="64" value=")rawliteral" + String(wifiNets[0].pass) + R"rawliteral(">
+    <label>Network 2 SSID / Password</label>
+    <input type="text" name="wssid1" id="wssid1" maxlength="32" value=")rawliteral" + String(wifiNets[1].ssid) + R"rawliteral(">
+    <input type="text" name="wpass1" id="wpass1" maxlength="64" value=")rawliteral" + String(wifiNets[1].pass) + R"rawliteral(">
+    <label>Network 3 SSID / Password</label>
+    <input type="text" name="wssid2" id="wssid2" maxlength="32" value=")rawliteral" + String(wifiNets[2].ssid) + R"rawliteral(">
+    <input type="text" name="wpass2" id="wpass2" maxlength="64" value=")rawliteral" + String(wifiNets[2].pass) + R"rawliteral(">
+    <label>Network 4 SSID / Password</label>
+    <input type="text" name="wssid3" id="wssid3" maxlength="32" value=")rawliteral" + String(wifiNets[3].ssid) + R"rawliteral(">
+    <input type="text" name="wpass3" id="wpass3" maxlength="64" value=")rawliteral" + String(wifiNets[3].pass) + R"rawliteral(">
+    <div class="section-hd">Location &amp; Radar</div>
     <label>Home Latitude (&deg;)</label>
     <input type="number" step="any" name="lat" id="lat" value=")rawliteral" + String(hLat, 6) + R"rawliteral(" required>
     <label>Home Longitude (&deg;)</label>
@@ -859,6 +978,14 @@ function save(e){
   };
   x.send('lat='+encodeURIComponent(document.getElementById('lat').value)+
          '&lon='+encodeURIComponent(document.getElementById('lon').value)+
+         '&wssid0='+encodeURIComponent(document.getElementById('wssid0').value)+
+         '&wpass0='+encodeURIComponent(document.getElementById('wpass0').value)+
+         '&wssid1='+encodeURIComponent(document.getElementById('wssid1').value)+
+         '&wpass1='+encodeURIComponent(document.getElementById('wpass1').value)+
+         '&wssid2='+encodeURIComponent(document.getElementById('wssid2').value)+
+         '&wpass2='+encodeURIComponent(document.getElementById('wpass2').value)+
+         '&wssid3='+encodeURIComponent(document.getElementById('wssid3').value)+
+         '&wpass3='+encodeURIComponent(document.getElementById('wpass3').value)+
          '&range='+encodeURIComponent(document.getElementById('range').value)+
          '&dark='+(document.getElementById('dark').checked?'1':'0')+
          '&bright='+encodeURIComponent(document.getElementById('bright').value)+
@@ -963,6 +1090,28 @@ function doOta(e){
     uint16_t newColTrDep = server.hasArg("c_trdep") ? hexToRgb565(server.arg("c_trdep")) : colTrailDep;
     uint16_t newColTrArr = server.hasArg("c_trarr") ? hexToRgb565(server.arg("c_trarr")) : colTrailArr;
     uint16_t newColTrOver = server.hasArg("c_trover") ? hexToRgb565(server.arg("c_trover")) : colTrailOver;
+
+    // WiFi network slots (optional). strncpy under configMutex since
+    // wifiMaintain() reads the slots on Core 1; NVS writes stay outside.
+    // If anything changed, drop the current connection — wifiMaintain()
+    // reconnects within seconds.
+    bool wifiChanged = false;
+    for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+      char ks[10], kp[10];
+      snprintf(ks, sizeof(ks), "wssid%d", i);
+      snprintf(kp, sizeof(kp), "wpass%d", i);
+      if (server.hasArg(ks)) {
+        String s = server.arg(ks);
+        String p = server.hasArg(kp) ? server.arg(kp) : "";
+        if (s != String(wifiNets[i].ssid) || p != String(wifiNets[i].pass)) wifiChanged = true;
+        if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+        strncpy(wifiNets[i].ssid, s.c_str(), 32); wifiNets[i].ssid[32] = '\0';
+        strncpy(wifiNets[i].pass, p.c_str(), 64); wifiNets[i].pass[64] = '\0';
+        if (configMutex) xSemaphoreGive(configMutex);
+        prefs.putString(ks, s);
+        prefs.putString(kp, p);
+      }
+    }
 
     // Basic validation
     if (newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180 ||
@@ -1075,6 +1224,10 @@ function doOta(e){
     Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,
                   newShowRoute, newShowReg, newShowSquawk, newShowVRate, newShowType, newShowTraces, newPreferTables);
+    if (wifiChanged) {
+      Serial.println("[wifi] credentials changed via web UI — reconnecting");
+      WiFi.disconnect(false);  // wifiMaintain() picks it up within seconds
+    }
     server.send(200, "text/plain", "OK");
   });
 

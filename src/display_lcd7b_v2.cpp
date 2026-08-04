@@ -1227,6 +1227,22 @@ void screenWeatherSystem() {
   gfx->setCursor(500, 300);
   gfx->printf("WiFi RSSI: %d dBm   ", WiFi.RSSI());
 
+  // Network identity + setup-AP status (WiFi management feature)
+  gfx->setCursor(500, 340);
+  if (wifiApFallbackActive) {
+    gfx->setTextColor(YELLOW, BLACK);
+    gfx->print("WiFi: SETUP AP 'PlaneSpotter-Setup'   ");
+    gfx->setCursor(500, 380);
+    gfx->print("Join it, open 192.168.4.1   ");
+    gfx->setTextColor(WHITE, BLACK);
+  } else if (WiFi.status() == WL_CONNECTED) {
+    gfx->printf("WiFi: %-16.16s   ", WiFi.SSID().c_str());
+    gfx->setCursor(500, 380);
+    gfx->printf("IP: %s   ", WiFi.localIP().toString().c_str());
+  } else {
+    gfx->print("WiFi: reconnecting...   ");
+  }
+
   gfx->setCursor(60, 360);
   gfx->printf("RAM Free: %d KB   ", ESP.getFreeHeap() / 1024);
 
@@ -1318,6 +1334,28 @@ void connectWiFiShow() {
   gfx->print("Connecting WiFi...");
   pushFrame();
   connectWiFi();
+  if (wifiApFallbackActive) {
+    // No saved network reachable — leave setup instructions on screen for a
+    // while so the user can fix credentials without USB/serial.
+    memset(panelFbs[drawBufIdx], 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+    gfx->setTextSize(4);
+    gfx->setTextColor(YELLOW, BLACK);
+    gfx->setCursor(20, 80);
+    gfx->print("WIFI SETUP MODE");
+    gfx->setTextSize(3);
+    gfx->setTextColor(WHITE, BLACK);
+    gfx->setCursor(20, 160);
+    gfx->print("1. Connect to WiFi: PlaneSpotter-Setup");
+    gfx->setCursor(20, 210);
+    gfx->print("2. Open http://192.168.4.1 in a browser");
+    gfx->setCursor(20, 260);
+    gfx->print("3. Enter your WiFi details and save");
+    gfx->setTextColor(CYAN, BLACK);
+    gfx->setCursor(20, 330);
+    gfx->print("The radar will join your network automatically.");
+    pushFrame();
+    delay(8000);
+  }
   gfx->fillScreen(BLACK);
   pushFrame();
 }

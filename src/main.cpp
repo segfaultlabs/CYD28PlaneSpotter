@@ -29,6 +29,7 @@ void setup() {
 
   // Load persisted config (or use defaults)
   prefs.begin("cyd-spotter", false);
+  wifiLoadNetworks();
   homeLat = prefs.getDouble("lat", homeLat);
   homeLon = prefs.getDouble("lon", homeLon);
   radarMaxKm = prefs.getFloat("range", radarMaxKm);
@@ -105,8 +106,9 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // WiFi health — reconnect if needed (shows status, so must be Core 1)
-  if (WiFi.status() != WL_CONNECTED) connectWiFiShow();
+  // WiFi health — non-blocking multi-network reconnect + fallback setup AP
+  // (the radar keeps running on stale data during outages)
+  wifiMaintain();
 
   // Weather fetch still runs in loop (it's infrequent, every 10 min)
   if (!firstWeatherDone || now - lastWeatherPoll >= WEATHER_INTERVAL_MS) {

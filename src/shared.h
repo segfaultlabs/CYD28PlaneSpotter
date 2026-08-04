@@ -67,6 +67,16 @@ extern uint16_t colTrailDep;       // trace: taking off
 extern uint16_t colTrailArr;       // trace: landing
 extern uint16_t colTrailOver;      // trace: flying over
 
+// ---------------------------------------------------------------------------
+// WiFi management: up to WIFI_MAX_NETWORKS saved networks (NVS-backed, slot 0
+// seeded from config.env on first boot), non-blocking reconnect in loop(),
+// and a fallback setup AP ("PlaneSpotter-Setup") when nothing is reachable.
+// ---------------------------------------------------------------------------
+#define WIFI_MAX_NETWORKS 4
+struct WifiNet { char ssid[33]; char pass[65]; };
+extern WifiNet wifiNets[WIFI_MAX_NETWORKS];
+extern bool wifiApFallbackActive;  // true while the setup AP is up
+
 extern SemaphoreHandle_t configMutex;  // protects homeLat/Lon/radarMaxKm/toggles
 extern WebServer server;
 extern Preferences prefs;
@@ -171,7 +181,9 @@ static void projectLatLon(double lat, double lon, float trackDeg, double distM, 
 // ---------------------------------------------------------------------------
 // Data layer, implemented once in data.cpp (board-agnostic)
 // ---------------------------------------------------------------------------
-void connectWiFi();  // pure network logic, no display calls — boards wrap this for visual feedback
+void connectWiFi();  // boot-time connect: tries all saved networks, starts fallback AP if none work
+void wifiLoadNetworks();  // load NVS network slots (seed slot 0 from config.env) — call after prefs.begin
+void wifiMaintain();   // non-blocking reconnect/AP-fallback state machine — call every loop()
 bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bool allowFetch = true);
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut);
