@@ -668,7 +668,7 @@ struct LabelRect { int x, y, w, h; };
 
 bool placeLabel(LabelRect *placed, int &placedCount, int maxPlaced,
                  int bx, int by, char lines[][12], int lineCount,
-                 int boundX, int boundY, int boundW, int boundH) {
+                 int boundX, int boundY, int boundW, int boundH, uint16_t color) {
   if (lineCount == 0) return false;
 
   int w = 0, h = 0;
@@ -705,7 +705,7 @@ bool placeLabel(LabelRect *placed, int &placedCount, int maxPlaced,
       }
     }
     if (!overlap) {
-      gfx->setTextColor(WHITE, BLACK);
+      gfx->setTextColor(color, BLACK);
       for (int li = 0; li < lineCount; li++) {
         gfx->setCursor(lx, ly + lineY[li]);
         gfx->print(lines[li]);
@@ -837,8 +837,9 @@ struct RadarCfg {
   bool showCS, showAir, showSpd, showFlt, showRte, showRg, showSq, showVr, showTy;
   uint8_t maxBlips; uint16_t trailSamp, trailStale, cAlt, redrawMs;
   float swpSec, cNear; int16_t cVr;
-  bool sApt, sKey, sComp;
+  bool sApt, sKey, sComp, quiet;
   uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
+  FilterRule rules[FILTER_MAX_RULES];
 };
 static RadarCfg radarCfgSnapshot() {
   RadarCfg c;
@@ -852,8 +853,20 @@ static RadarCfg radarCfgSnapshot() {
   c.sApt = showAirports; c.sKey = showTrailKey; c.sComp = showCompass;
   c.cSweep = colSweep; c.cBlip = colBlip; c.cBlipHi = colBlipHi; c.cRings = colRings; c.cAirpt = colAirport;
   c.cTrDep = colTrailDep; c.cTrArr = colTrailArr; c.cTrOver = colTrailOver;
+  c.quiet = filterQuiet;
+  memcpy(c.rules, filterRules, sizeof(c.rules));
   if (configMutex) xSemaphoreGive(configMutex);
   return c;
+}
+
+// Index of the first filter rule matching this blip, or -1.
+static int filterMatchBlip(const Blip &b, const FilterRule *rules) {
+  for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
+    if (!rules[i].enabled || !rules[i].text[0]) continue;
+    const char *field = rules[i].match == FM_REG ? b.reg : rules[i].match == FM_TYPE ? b.typeCode : b.callsign;
+    if (filterPrefixMatch(field, rules[i].text)) return i;
+  }
+  return -1;
 }
 void drawRadarFurniture(const RadarLayout &L, const RadarCfg &cfg);
 void drawRadarStatic(const RadarLayout &L, const RadarCfg &cfg);
@@ -1098,7 +1111,16 @@ void drawRadarTrails(const RadarLayout &L, const RadarCfg &cfg, uint8_t slotFrom
       // sample-to-sample movement is only a few px), and doesn't read as
       // "a path" the way a real radar trace does.
       const Blip *owner = findBlipByCallsign(t.callsign);
-      uint16_t trailColor = owner ? trailColors[classifyBlip(*owner, cfg.cNear, cfg.cAlt, cfg.cVr)] : cfg.cTrOver;
+      uint16_t trailColor;
+      if (!owner) {
+        trailColor = cfg.cTrOver;
+      } else {
+        int rule = filterMatchBlip(*owner, cfg.rules);
+        if (rule >= 0 && cfg.rules[rule].action == FA_HIDE) continue;  // hidden traffic leaves no trail
+        trailColor = (rule >= 0 && (cfg.rules[rule].action == FA_HIGHLIGHT || cfg.rules[rule].action == FA_ALERT))
+                     ? cfg.rules[rule].color
+                     : trailColors[classifyBlip(*owner, cfg.cNear, cfg.cAlt, cfg.cVr)];
+      }
       int prevPx = 0, prevPy = 0; bool havePrev = false;
       for (uint16_t j = 0; j < t.count; j++) {
         // Polar cache hit: no trig here at all, just scale + offset.
@@ -1117,19 +1139,40 @@ void drawRadarTrails(const RadarLayout &L, const RadarCfg &cfg, uint8_t slotFrom
                  cfg.cTrDep, cfg.cTrArr, cfg.cTrOver, cfg.cAirpt);
 }
 
-// Blips (projected positions) + their collision-avoided labels.
+// Blips (projected positions) + their collision-avoided labels, with the
+// traffic filter/watchlist applied: hide/only remove blips, highlight/alert
+// recolor them (+ label + banner), quiet mode dims everything when nothing
+// watched is airborne.
 void drawRadarBlips(const RadarLayout &L, const RadarCfg &cfg) {
   const int cx = L.cx, cy = L.cy, R = L.R;
   float sweepDeg = fmodf(millis() / (cfg.swpSec * 1000.0f / 360.0f), 360.0f);
   float elapsed = (millis() - lastDataMs) / 1000.0f;
 
+  // Filter pass 1: match every blip once; frame-level state.
+  int ruleOf[MAX_BLIPS];
+  bool hasOnly = false, anyWatchAirborne = false;
+  for (uint8_t i = 0; i < blipCount; i++) {
+    ruleOf[i] = filterMatchBlip(blips[i], cfg.rules);
+    if (ruleOf[i] >= 0) {
+      uint8_t a = cfg.rules[ruleOf[i]].action;
+      if (a == FA_ONLY) hasOnly = true;
+      if (a == FA_HIGHLIGHT || a == FA_ALERT) anyWatchAirborne = true;
+    }
+  }
+
   gfx->setTextSize(2);
 
   LabelRect placed[MAX_BLIPS];
   int placedCount = 0;
+  const char *alertCs = nullptr;
+  uint16_t alertColor = 0;
 
   uint8_t maxB = cfg.maxBlips < blipCount ? cfg.maxBlips : blipCount;
   for (uint8_t i = 0; i < maxB; i++) {
+      int rule = ruleOf[i];
+      if (rule >= 0 && cfg.rules[rule].action == FA_HIDE) continue;
+      if (hasOnly && (rule < 0 || cfg.rules[rule].action != FA_ONLY)) continue;
+
       double la = blips[i].lat, lo = blips[i].lon;
       if (blips[i].speedMs > 0 && elapsed > 0)
         projectLatLon(blips[i].lat, blips[i].lon, blips[i].track, blips[i].speedMs * elapsed, la, lo);
@@ -1144,7 +1187,19 @@ void drawRadarBlips(const RadarLayout &L, const RadarCfg &cfg) {
       int by = cy - (int)(cos(deg2rad(brg)) * rr);
 
       float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
-      uint16_t blipColor = (behind < 30) ? cfg.cBlipHi : cfg.cBlip;
+      uint16_t blipColor, labelColor;
+      if (rule >= 0 && (cfg.rules[rule].action == FA_HIGHLIGHT || cfg.rules[rule].action == FA_ALERT)) {
+        blipColor = labelColor = cfg.rules[rule].color;
+        if (cfg.rules[rule].action == FA_ALERT && !alertCs && blips[i].callsign[0]) {
+          alertCs = blips[i].callsign;
+          alertColor = cfg.rules[rule].color;
+        }
+      } else if (cfg.quiet && !anyWatchAirborne) {
+        blipColor = labelColor = DARKGREY;
+      } else {
+        blipColor = (behind < 30) ? cfg.cBlipHi : cfg.cBlip;
+        labelColor = WHITE;
+      }
       if (strcmp(blips[i].category, "A7") == 0)
         drawHelicopterIcon(bx, by, blips[i].track, blipColor);
       else
@@ -1189,9 +1244,25 @@ void drawRadarBlips(const RadarLayout &L, const RadarCfg &cfg) {
         }
 
         placeLabel(placed, placedCount, MAX_BLIPS, bx, by, lines, lineCount,
-                   L.boundX, L.boundY, L.boundW, L.boundH);
+                   L.boundX, L.boundY, L.boundW, L.boundH, labelColor);
       }
     }
+
+  // Alert banner: a watched aircraft is in range. Top-center of the radar
+  // area, filled strip in the rule's color.
+  if (alertCs) {
+    char msg[24];
+    snprintf(msg, sizeof(msg), "ALERT: %s", alertCs);
+    gfx->setTextSize(3);
+    int16_t x1, y1; uint16_t tw, th;
+    gfx->getTextBounds(msg, 0, 0, &x1, &y1, &tw, &th);
+    int bx = cx - (int)tw / 2;
+    int by = L.full ? 45 : L.boundY + 10;
+    gfx->fillRect(bx - 8, by - 4, tw + 16, th + 10, alertColor);
+    gfx->setTextColor(BLACK, alertColor);
+    gfx->setCursor(bx, by);
+    gfx->print(msg);
+  }
 }
 
 void screenWeatherSystem() {

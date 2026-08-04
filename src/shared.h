@@ -68,6 +68,25 @@ extern uint16_t colTrailArr;       // trace: landing
 extern uint16_t colTrailOver;      // trace: flying over
 
 // ---------------------------------------------------------------------------
+// Traffic filter / watchlist: up to FILTER_MAX_RULES rules, each matching a
+// prefix of callsign / registration / type code, with an action. Precedence:
+// only > hide > highlight > default. Quiet mode dims all traffic when no
+// highlight/alert-matched aircraft is currently in range.
+// ---------------------------------------------------------------------------
+#define FILTER_MAX_RULES 5
+enum FilterMatch : uint8_t { FM_CALLSIGN = 0, FM_REG, FM_TYPE };
+enum FilterAction : uint8_t { FA_HIGHLIGHT = 0, FA_HIDE, FA_ONLY, FA_ALERT };
+struct FilterRule {
+  bool enabled = false;
+  uint8_t match = FM_CALLSIGN;
+  char text[12] = {0};            // case-insensitive prefix
+  uint8_t action = FA_HIGHLIGHT;
+  uint16_t color = 0xF81F;        // highlight/alert color (RGB565)
+};
+extern FilterRule filterRules[FILTER_MAX_RULES];
+extern bool filterQuiet;
+
+// ---------------------------------------------------------------------------
 // WiFi management: up to WIFI_MAX_NETWORKS saved networks (NVS-backed, slot 0
 // seeded from config.env on first boot), non-blocking reconnect in loop(),
 // and a fallback setup AP ("PlaneSpotter-Setup") when nothing is reachable.
@@ -176,6 +195,16 @@ static void projectLatLon(double lat, double lon, float trackDeg, double distM, 
   double nla = asin(sin(la) * cos(dr) + cos(la) * sin(dr) * cos(b));
   double nlo = lo + atan2(sin(b) * sin(dr) * cos(la), cos(dr) - sin(la) * sin(nla));
   outLat = rad2deg(nla); outLon = rad2deg(nlo);
+}
+
+// Case-insensitive prefix match, skipping leading spaces (adsb callsigns
+// are often space-padded). Used by the traffic filter rules.
+static bool filterPrefixMatch(const char *s, const char *prefix) {
+  while (*s == ' ') s++;
+  while (*prefix) {
+    if (toupper((unsigned char)*s++) != toupper((unsigned char)*prefix++)) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

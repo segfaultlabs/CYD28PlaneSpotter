@@ -57,6 +57,9 @@ uint16_t colTrailDep = 0x07FF;   // CYAN
 uint16_t colTrailArr = 0xFD20;   // ORANGE
 uint16_t colTrailOver = 0xFFE0;  // YELLOW
 
+FilterRule filterRules[FILTER_MAX_RULES];
+bool filterQuiet = false;
+
 SemaphoreHandle_t configMutex = NULL;
 WebServer server(80);
 Preferences prefs;
@@ -788,6 +791,11 @@ void initWebServer() {
   .section-hd{color:#888;font-size:0.75em;text-transform:uppercase;letter-spacing:0.05em;margin:18px 0 4px;border-top:1px solid #333;padding-top:14px}
   input[type=range]{width:100%;padding:0;accent-color:#00ff88}
   input[type=color]{width:64px;height:34px;padding:2px;vertical-align:middle}
+  select{padding:8px;border:1px solid #333;border-radius:6px;background:#0d0d1f;color:#fff;font-size:0.9em}
+  .fr-row{display:flex;gap:6px;align-items:center;margin:8px 0}
+  .fr-row input[type=text]{flex:1;min-width:0}
+  .fr-row input[type=checkbox]{width:auto}
+  .fr-row input[type=color]{width:44px;flex-shrink:0}
   .color-row{display:flex;align-items:center;justify-content:space-between;margin:8px 0}
   .color-row label{margin:0;color:#e0e0e0;font-size:0.95em}
   .note{color:#666;font-size:0.75em;margin:2px 0 6px}
@@ -959,6 +967,50 @@ void initWebServer() {
     <div class="section-hd">Data Fetch</div>
     <label>Aircraft poll interval (seconds, 5-600)</label>
     <input type="number" name="fetchsec" id="fetchsec" min="5" max="600" value=")rawliteral" + String(fetchSec) + R"rawliteral(">
+    <div class="section-hd">Traffic Filter / Watchlist</div>
+    <div class="note">Case-insensitive prefix match. <b>Highlight</b> colors blip+trail; <b>Hide</b> removes it; <b>Only</b> shows exclusively matching planes (when any Only rule is on); <b>Alert</b> adds a banner when a match is in range. Quiet mode dims ALL traffic while nothing watched is airborne.</div>
+    <div class="fr-row">
+      <input type="checkbox" id="fr_en0">
+      <select id="fr_m0"><option value="0">Callsign</option><option value="1">Reg</option><option value="2">Type</option></select>
+      <input type="text" id="fr_t0" maxlength="11" placeholder="e.g. KAL">
+      <select id="fr_a0"><option value="0">Highlight</option><option value="1">Hide</option><option value="2">Only</option><option value="3">Alert</option></select>
+      <input type="color" id="fr_c0">
+    </div>
+    <div class="fr-row">
+      <input type="checkbox" id="fr_en1">
+      <select id="fr_m1"><option value="0">Callsign</option><option value="1">Reg</option><option value="2">Type</option></select>
+      <input type="text" id="fr_t1" maxlength="11" placeholder="">
+      <select id="fr_a1"><option value="0">Highlight</option><option value="1">Hide</option><option value="2">Only</option><option value="3">Alert</option></select>
+      <input type="color" id="fr_c1">
+    </div>
+    <div class="fr-row">
+      <input type="checkbox" id="fr_en2">
+      <select id="fr_m2"><option value="0">Callsign</option><option value="1">Reg</option><option value="2">Type</option></select>
+      <input type="text" id="fr_t2" maxlength="11" placeholder="">
+      <select id="fr_a2"><option value="0">Highlight</option><option value="1">Hide</option><option value="2">Only</option><option value="3">Alert</option></select>
+      <input type="color" id="fr_c2">
+    </div>
+    <div class="fr-row">
+      <input type="checkbox" id="fr_en3">
+      <select id="fr_m3"><option value="0">Callsign</option><option value="1">Reg</option><option value="2">Type</option></select>
+      <input type="text" id="fr_t3" maxlength="11" placeholder="">
+      <select id="fr_a3"><option value="0">Highlight</option><option value="1">Hide</option><option value="2">Only</option><option value="3">Alert</option></select>
+      <input type="color" id="fr_c3">
+    </div>
+    <div class="fr-row">
+      <input type="checkbox" id="fr_en4">
+      <select id="fr_m4"><option value="0">Callsign</option><option value="1">Reg</option><option value="2">Type</option></select>
+      <input type="text" id="fr_t4" maxlength="11" placeholder="">
+      <select id="fr_a4"><option value="0">Highlight</option><option value="1">Hide</option><option value="2">Only</option><option value="3">Alert</option></select>
+      <input type="color" id="fr_c4">
+    </div>
+    <div class="switch-row">
+      <label for="fr_quiet">Quiet mode (dim all traffic unless watched is up)</label>
+      <label class="switch">
+        <input type="checkbox" id="fr_quiet">
+        <span class="slider"></span>
+      </label>
+    </div>
     <button type="submit">Save Settings</button>
   </form>
   <div class="saved" id="msg">&#10003; Settings saved!</div>
@@ -1004,6 +1056,20 @@ function useMyLocation() {
     map.setView([pos.coords.latitude, pos.coords.longitude], 11);
   });
 }
+// --- filter rules init
+function initRule(i,en,m,t,a,c){
+  document.getElementById('fr_en'+i).checked=(en==1);
+  document.getElementById('fr_m'+i).value=String(m);
+  document.getElementById('fr_t'+i).value=t;
+  document.getElementById('fr_a'+i).value=String(a);
+  document.getElementById('fr_c'+i).value=c;
+}
+initRule(0,)rawliteral" + String(filterRules[0].enabled ? 1 : 0) + "," + String(filterRules[0].match) + ",'" + String(filterRules[0].text) + "'," + String(filterRules[0].action) + ",'" + rgb565ToHex(filterRules[0].color) + R"rawliteral(');
+initRule(1,)rawliteral" + String(filterRules[1].enabled ? 1 : 0) + "," + String(filterRules[1].match) + ",'" + String(filterRules[1].text) + "'," + String(filterRules[1].action) + ",'" + rgb565ToHex(filterRules[1].color) + R"rawliteral(');
+initRule(2,)rawliteral" + String(filterRules[2].enabled ? 1 : 0) + "," + String(filterRules[2].match) + ",'" + String(filterRules[2].text) + "'," + String(filterRules[2].action) + ",'" + rgb565ToHex(filterRules[2].color) + R"rawliteral(');
+initRule(3,)rawliteral" + String(filterRules[3].enabled ? 1 : 0) + "," + String(filterRules[3].match) + ",'" + String(filterRules[3].text) + "'," + String(filterRules[3].action) + ",'" + rgb565ToHex(filterRules[3].color) + R"rawliteral(');
+initRule(4,)rawliteral" + String(filterRules[4].enabled ? 1 : 0) + "," + String(filterRules[4].match) + ",'" + String(filterRules[4].text) + "'," + String(filterRules[4].action) + ",'" + rgb565ToHex(filterRules[4].color) + R"rawliteral(');
+document.getElementById('fr_quiet').checked = )rawliteral" + String(filterQuiet ? "true" : "false") + R"rawliteral(;
 function save(e){
   e.preventDefault();
   var x=new XMLHttpRequest();
@@ -1056,7 +1122,16 @@ function save(e){
          '&c_trover='+encodeURIComponent(document.getElementById('c_trover').value)+
          '&showapt='+(document.getElementById('showapt').checked?'1':'0')+
          '&showcomp='+(document.getElementById('showcomp').checked?'1':'0')+
-         '&showkey='+(document.getElementById('showkey').checked?'1':'0'));
+         '&showkey='+(document.getElementById('showkey').checked?'1':'0')+
+         '&fr_quiet='+(document.getElementById('fr_quiet').checked?'1':'0')+
+         ruleArgs(0)+ruleArgs(1)+ruleArgs(2)+ruleArgs(3)+ruleArgs(4));
+}
+function ruleArgs(i){
+  return '&fr_en'+i+'='+(document.getElementById('fr_en'+i).checked?'1':'0')+
+         '&fr_m'+i+'='+document.getElementById('fr_m'+i).value+
+         '&fr_t'+i+'='+encodeURIComponent(document.getElementById('fr_t'+i).value)+
+         '&fr_a'+i+'='+document.getElementById('fr_a'+i).value+
+         '&fr_c'+i+'='+encodeURIComponent(document.getElementById('fr_c'+i).value);
 }
 function doOta(e){
   e.preventDefault();
@@ -1127,6 +1202,26 @@ function doOta(e){
     uint16_t newColTrDep = server.hasArg("c_trdep") ? hexToRgb565(server.arg("c_trdep")) : colTrailDep;
     uint16_t newColTrArr = server.hasArg("c_trarr") ? hexToRgb565(server.arg("c_trarr")) : colTrailArr;
     uint16_t newColTrOver = server.hasArg("c_trover") ? hexToRgb565(server.arg("c_trover")) : colTrailOver;
+
+    // Traffic filter rules (optional args keep current rule state)
+    FilterRule newRules[FILTER_MAX_RULES];
+    memcpy(newRules, filterRules, sizeof(newRules));
+    for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
+      char ken[9], km[8], kt[8], ka[8], kc[8];
+      snprintf(ken, sizeof(ken), "fr_en%d", i);
+      snprintf(km, sizeof(km), "fr_m%d", i);
+      snprintf(kt, sizeof(kt), "fr_t%d", i);
+      snprintf(ka, sizeof(ka), "fr_a%d", i);
+      snprintf(kc, sizeof(kc), "fr_c%d", i);
+      if (server.hasArg(ken)) {
+        newRules[i].enabled = server.arg(ken) == "1";
+        newRules[i].match = (uint8_t)constrain(server.arg(km).toInt(), 0, 2);
+        strncpy(newRules[i].text, server.arg(kt).c_str(), 11); newRules[i].text[11] = '\0';
+        newRules[i].action = (uint8_t)constrain(server.arg(ka).toInt(), 0, 3);
+        newRules[i].color = hexToRgb565(server.arg(kc));
+      }
+    }
+    bool newQuiet = server.hasArg("fr_quiet") ? (server.arg("fr_quiet") == "1") : filterQuiet;
 
     // WiFi network slots (optional). strncpy under configMutex since
     // wifiMaintain() reads the slots on Core 1; NVS writes stay outside.
@@ -1216,6 +1311,8 @@ function doOta(e){
     colTrailDep = newColTrDep;
     colTrailArr = newColTrArr;
     colTrailOver = newColTrOver;
+    memcpy(filterRules, newRules, sizeof(filterRules));
+    filterQuiet = newQuiet;
     if (configMutex) xSemaphoreGive(configMutex);
     applyInvertColors(newInvert);
     applyBrightness(newBrightness);
@@ -1257,6 +1354,20 @@ function doOta(e){
     prefs.putUShort("c_trdep", newColTrDep);
     prefs.putUShort("c_trarr", newColTrArr);
     prefs.putUShort("c_trover", newColTrOver);
+    for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
+      char ken[9], km[8], kt[8], ka[8], kc[8];
+      snprintf(ken, sizeof(ken), "fr_en%d", i);
+      snprintf(km, sizeof(km), "fr_m%d", i);
+      snprintf(kt, sizeof(kt), "fr_t%d", i);
+      snprintf(ka, sizeof(ka), "fr_a%d", i);
+      snprintf(kc, sizeof(kc), "fr_c%d", i);
+      prefs.putBool(ken, newRules[i].enabled);
+      prefs.putUChar(km, newRules[i].match);
+      prefs.putString(kt, newRules[i].text);
+      prefs.putUChar(ka, newRules[i].action);
+      prefs.putUShort(kc, newRules[i].color);
+    }
+    prefs.putBool("fr_quiet", newQuiet);
 
     Serial.printf("Config saved: lat=%.6f lon=%.6f range=%.1f invert=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
                   newLat, newLon, newRng, newInvert, newShowCallsign, newShowAirline, newShowSpeed, newShowFL,

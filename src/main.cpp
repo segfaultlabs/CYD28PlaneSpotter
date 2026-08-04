@@ -66,6 +66,21 @@ void setup() {
   colTrailDep = prefs.getUShort("c_trdep", colTrailDep);
   colTrailArr = prefs.getUShort("c_trarr", colTrailArr);
   colTrailOver = prefs.getUShort("c_trover", colTrailOver);
+  for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
+    char ken[9], km[8], kt[8], ka[8], kc[8];
+    snprintf(ken, sizeof(ken), "fr_en%d", i);
+    snprintf(km, sizeof(km), "fr_m%d", i);
+    snprintf(kt, sizeof(kt), "fr_t%d", i);
+    snprintf(ka, sizeof(ka), "fr_a%d", i);
+    snprintf(kc, sizeof(kc), "fr_c%d", i);
+    filterRules[i].enabled = prefs.getBool(ken, filterRules[i].enabled);
+    filterRules[i].match = prefs.getUChar(km, filterRules[i].match);
+    String ft = prefs.getString(kt, filterRules[i].text);
+    strncpy(filterRules[i].text, ft.c_str(), 11); filterRules[i].text[11] = '\0';
+    filterRules[i].action = prefs.getUChar(ka, filterRules[i].action);
+    filterRules[i].color = prefs.getUShort(kc, filterRules[i].color);
+  }
+  filterQuiet = prefs.getBool("fr_quiet", filterQuiet);
   applyInvertColors(invertColors);
   applyBrightness(brightness);
   Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d bright=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
