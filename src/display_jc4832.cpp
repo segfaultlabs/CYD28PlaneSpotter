@@ -651,3 +651,5 @@ void checkTouch() {
 // displayPanelSync is only meaningful on the RGB-parallel LCD-7B boards
 // (driver restart after flash-write bursts); these panels need nothing.
 void displayPanelSync() {}
+
+uint8_t displayNumScreens() { return 4; }  // Target Intel, Top 5, Radar, Weather & System

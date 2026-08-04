@@ -61,6 +61,11 @@ extern bool     showCompass;
 extern bool     sweepGlow;         // phosphor afterglow behind the sweep
 extern uint8_t  sweepGlowLen;      // afterglow segments (1 = off, up to 12)
 
+// Auto-cycle (kiosk mode): rotate through the screens on a timer. Any touch
+// pauses cycling for one interval.
+extern bool     autoCycleOn;       // default on
+extern uint16_t autoCycleSec;      // seconds per screen (default 5)
+
 // Day/night cycle: the weather widget shows sun by day / moon by night
 // (fixed 07:00-19:00 day), and the backlight can auto-dim on a schedule.
 extern bool     nightDimOn;
@@ -248,5 +253,6 @@ void connectWiFiShow();            // shows a "connecting" indicator, calls conn
 void applyInvertColors(bool invert);
 void applyBrightness(uint8_t percent);  // 0-100
 void displayPanelSync();           // hard display resync after flash-write bursts (RGB panels: driver restart; others: no-op)
+uint8_t displayNumScreens();       // how many screens this board cycles through
 void render();
 void checkTouch();

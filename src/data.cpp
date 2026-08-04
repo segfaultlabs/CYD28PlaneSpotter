@@ -68,6 +68,8 @@ bool     showTrailKey = true;
 bool     showCompass = true;
 bool     sweepGlow = true;
 uint8_t  sweepGlowLen = 6;
+bool     autoCycleOn = true;
+uint16_t autoCycleSec = 5;
 bool     nightDimOn = false;
 uint8_t  nightStartHr = 22;
 uint8_t  nightEndHr = 7;
@@ -209,6 +211,8 @@ static void configPersistAll() {
   prefs.putUChar("nd_start", nightStartHr);
   prefs.putUChar("nd_end", nightEndHr);
   prefs.putUChar("nd_bright", nightBrightPct);
+  prefs.putBool("acycle", autoCycleOn);
+  prefs.putUShort("acyclesec", autoCycleSec);
   prefs.putBool("fr_quiet", filterQuiet);
   for (uint8_t i = 0; i < FILTER_MAX_RULES; i++) {
     char ken[9], km[8], kt[8], ka[8], kc[8];
@@ -961,6 +965,7 @@ void initWebServer() {
     float swpSec, cNear; int16_t cVr;
     bool sApt, sKey, sComp, glowOn; uint8_t glowLen;
     bool ndOn; uint8_t ndStart, ndEnd, ndBright;
+    bool aCycOn; uint16_t aCycSec;
     uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; rMax = radarMaxKm; inv = invertColors; bright = brightness;
@@ -972,6 +977,7 @@ void initWebServer() {
     sApt = showAirports; sKey = showTrailKey; sComp = showCompass;
     glowOn = sweepGlow; glowLen = sweepGlowLen;
     ndOn = nightDimOn; ndStart = nightStartHr; ndEnd = nightEndHr; ndBright = nightBrightPct;
+    aCycOn = autoCycleOn; aCycSec = autoCycleSec;
     cSweep = colSweep; cBlip = colBlip; cBlipHi = colBlipHi; cRings = colRings; cAirpt = colAirport;
     cTrDep = colTrailDep; cTrArr = colTrailArr; cTrOver = colTrailOver;
     if (configMutex) xSemaphoreGive(configMutex);
@@ -1149,6 +1155,15 @@ void initWebServer() {
     </div>
     <label>Afterglow length (segments, 1-12)</label>
     <input type="number" name="swpglowlen" id="swpglowlen" min="1" max="12" value=")rawliteral" + String(glowLen) + R"rawliteral(">
+    <div class="switch-row">
+      <label for="acycle">Auto-cycle screens</label>
+      <label class="switch">
+        <input type="checkbox" id="acycle")rawliteral" + String(aCycOn ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <label>Seconds per screen (2-300)</label>
+    <input type="number" name="acyclesec" id="acyclesec" min="2" max="300" value=")rawliteral" + String(aCycSec) + R"rawliteral(">
     <label>Full screen refresh interval (ms)</label>
     <input type="number" step="50" name="redrawms" id="redrawms" min="200" max="5000" value=")rawliteral" + String(redrawMs) + R"rawliteral(">
     <div class="color-row"><label>Sweep line</label><input type="color" name="c_sweep" id="c_sweep" value=")rawliteral" + rgb565ToHex(cSweep) + R"rawliteral("></div>
@@ -1409,6 +1424,8 @@ function save(e){
          '&nd_start='+encodeURIComponent(document.getElementById('nd_start').value)+
          '&nd_end='+encodeURIComponent(document.getElementById('nd_end').value)+
          '&nd_bright='+encodeURIComponent(document.getElementById('nd_bright').value)+
+         '&acycle='+(document.getElementById('acycle').checked?'1':'0')+
+         '&acyclesec='+encodeURIComponent(document.getElementById('acyclesec').value)+
          '&fr_quiet='+(document.getElementById('fr_quiet').checked?'1':'0')+
          ruleArgs(0)+ruleArgs(1)+ruleArgs(2)+ruleArgs(3)+ruleArgs(4));
 }
@@ -1519,6 +1536,18 @@ function doReboot(){
     uint8_t newGlowLen = server.hasArg("swpglowlen") ? (uint8_t)server.arg("swpglowlen").toInt() : sweepGlowLen;
     if (newGlowLen < 1) newGlowLen = 1;
     if (newGlowLen > 12) newGlowLen = 12;
+    bool newACycOn = server.hasArg("acycle") ? (server.arg("acycle") == "1") : autoCycleOn;
+    uint16_t newACycSec = server.hasArg("acyclesec") ? (uint16_t)server.arg("acyclesec").toInt() : autoCycleSec;
+    if (newACycSec < 2) newACycSec = 2;
+    if (newACycSec > 300) newACycSec = 300;
+    bool newNdOn = server.hasArg("nd_on") ? (server.arg("nd_on") == "1") : nightDimOn;
+    uint8_t newNdStart = server.hasArg("nd_start") ? (uint8_t)server.arg("nd_start").toInt() : nightStartHr;
+    uint8_t newNdEnd = server.hasArg("nd_end") ? (uint8_t)server.arg("nd_end").toInt() : nightEndHr;
+    uint8_t newNdBright = server.hasArg("nd_bright") ? (uint8_t)server.arg("nd_bright").toInt() : nightBrightPct;
+    if (newNdStart > 23) newNdStart = 23;
+    if (newNdEnd > 23) newNdEnd = 23;
+    if (newNdBright < 1) newNdBright = 1;
+    if (newNdBright > 100) newNdBright = 100;
 
     // WiFi network slots (optional). strncpy under configMutex since
     // wifiMaintain() reads the slots on Core 1; NVS writes stay outside.
@@ -1610,6 +1639,12 @@ function doReboot(){
     filterQuiet = newQuiet;
     sweepGlow = newGlowOn;
     sweepGlowLen = newGlowLen;
+    autoCycleOn = newACycOn;
+    autoCycleSec = newACycSec;
+    nightDimOn = newNdOn;
+    nightStartHr = newNdStart;
+    nightEndHr = newNdEnd;
+    nightBrightPct = newNdBright;
     if (configMutex) xSemaphoreGive(configMutex);
     applyInvertColors(newInvert);
     applyBrightness(newBrightness);

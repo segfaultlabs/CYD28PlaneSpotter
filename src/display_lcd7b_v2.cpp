@@ -1938,3 +1938,5 @@ void checkTouch() {
   snprintf(dbgTouchAction, sizeof(dbgTouchAction), "cycle scr=%d", (screen + 1) % LCD7B_NUM_SCREENS);
   screen = (screen + 1) % LCD7B_NUM_SCREENS;
 }
+
+uint8_t displayNumScreens() { return LCD7B_NUM_SCREENS; }

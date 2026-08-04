@@ -87,6 +87,8 @@ void setup() {
   nightStartHr = prefs.getUChar("nd_start", nightStartHr);
   nightEndHr = prefs.getUChar("nd_end", nightEndHr);
   nightBrightPct = prefs.getUChar("nd_bright", nightBrightPct);
+  autoCycleOn = prefs.getBool("acycle", autoCycleOn);
+  autoCycleSec = prefs.getUShort("acyclesec", autoCycleSec);
   applyInvertColors(invertColors);
   applyBrightness(brightness);
   Serial.printf("Config loaded: lat=%.6f lon=%.6f range=%.1f invert=%d bright=%d callsign=%d airline=%d speed=%d fl=%d route=%d reg=%d squawk=%d vrate=%d type=%d traces=%d tables=%d\n",
@@ -154,6 +156,16 @@ void loop() {
 
   // Deferred config persistence (NVS writes stay out of the interactive path)
   configMaintain();
+
+  // Auto-cycle (kiosk mode): rotate screens on a timer; any touch pauses
+  // cycling for one interval. Screen count comes from the board.
+  if (autoCycleOn) {
+    uint32_t lastAct = lastScreenSwap > lastTouchMs ? lastScreenSwap : lastTouchMs;
+    if (now - lastAct >= (uint32_t)autoCycleSec * 1000UL) {
+      screen = (screen + 1) % displayNumScreens();
+      lastScreenSwap = now;
+    }
+  }
 
   // Weather fetch still runs in loop (it's infrequent, every 10 min)
   if (!firstWeatherDone || now - lastWeatherPoll >= WEATHER_INTERVAL_MS) {

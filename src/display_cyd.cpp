@@ -837,3 +837,5 @@ void applyBrightness(uint8_t percent) {
 // displayPanelSync is only meaningful on the RGB-parallel LCD-7B boards
 // (driver restart after flash-write bursts); these panels need nothing.
 void displayPanelSync() {}
+
+uint8_t displayNumScreens() { return NUM_SCREENS; }  // shared.h: 5 screens on the CYD
