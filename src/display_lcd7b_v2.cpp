@@ -427,10 +427,12 @@ void initRGBPanel() {
   // pulling pixels from the wrong address — a line-by-line shift. Their
   // documented fix is enabling the bounce buffer (fast internal-SRAM staging
   // buffers DMA reads from instead of PSRAM directly), sized >= 20 lines to
-  // keep enough VBlank margin for the ISR refill. This is also why this had
-  // to be a core-3.x environment in the first place, separate from that
-  // research: this fix needs ESP-IDF >= 5.1, which arduino-esp32 2.x (this
-  // project's other boards) bundles an older ESP-IDF that predates.
+  // keep enough VBlank margin for the ISR refill. 30 lines was tried for
+  // extra pclk margin — it costs 2x20KB more internal SRAM, which dropped
+  // heap_free to ~35K and the largest contiguous block below what TLS
+  // needs (~40KB). Reverted: on this 80MHz-PSRAM build there is no free
+  // pclk headroom to buy with a bigger buffer anyway — the real margin
+  // comes from the 120MHz-PSRAM v3 config (64B cache lines, IRAM-safe ISR).
   cfg.bounce_buffer_size_px = LCD_W * 20;
   cfg.hsync_gpio_num = PIN_HSYNC;
   cfg.vsync_gpio_num = PIN_VSYNC;
