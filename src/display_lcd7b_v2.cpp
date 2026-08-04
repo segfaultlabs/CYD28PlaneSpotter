@@ -38,6 +38,7 @@
 #include <Wire.h>
 #include "IOExtension.h"
 #include "GT911_touch.h"
+#include "qrcodegen.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
 #include "esp_lcd_panel_vendor.h"
@@ -1265,6 +1266,22 @@ void drawRadarBlips(const RadarLayout &L, const RadarCfg &cfg) {
   }
 }
 
+// Renders a QR code (Nayuki qrcodegen, vendored) with a quiet-zone border.
+// Used for the config-page URL on the Weather & System screen.
+static void drawQrCode(int x, int y, int scale, const char *text, uint16_t fg, uint16_t bg) {
+  static uint8_t qrcode[qrcodegen_BUFFER_LEN_MAX];
+  static uint8_t temp[qrcodegen_BUFFER_LEN_MAX];
+  if (!qrcodegen_encodeText(text, temp, qrcode, qrcodegen_Ecc_LOW,
+                            qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                            qrcodegen_Mask_AUTO, true)) return;
+  int size = qrcodegen_getSize(qrcode);
+  gfx->fillRect(x - 4 * scale, y - 4 * scale, (size + 8) * scale, (size + 8) * scale, bg);
+  for (int qy = 0; qy < size; qy++)
+    for (int qx = 0; qx < size; qx++)
+      if (qrcodegen_getModule(qrcode, qx, qy))
+        gfx->fillRect(x + qx * scale, y + qy * scale, scale, scale, fg);
+}
+
 void screenWeatherSystem() {
   drawHeader("WEATHER & SYSTEM");
   gfx->drawLine(20, 250, 1000, 250, DARKGREY);
@@ -1322,6 +1339,20 @@ void screenWeatherSystem() {
 
   gfx->setCursor(60, 420);
   gfx->printf("API Req: %lu OK / %lu FAIL   ", stats.requestsOk, stats.requestsFail);
+
+  // Config-page URL as text + QR code — point a phone camera at it to open
+  // the web UI without typing an IP. In setup-AP mode the QR points at the
+  // AP's config address instead.
+  {
+    char url[40];
+    if (wifiApFallbackActive) strcpy(url, "http://192.168.4.1/");
+    else snprintf(url, sizeof(url), "http://%s/", WiFi.localIP().toString().c_str());
+    gfx->setTextSize(2);
+    gfx->setTextColor(CYAN, BLACK);
+    gfx->setCursor(60, 480);
+    gfx->printf("Config: %s   ", url);
+    drawQrCode(830, 430, 4, url, BLACK, WHITE);
+  }
 }
 
 void displaySetup() {
