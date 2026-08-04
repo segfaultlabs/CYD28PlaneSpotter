@@ -316,6 +316,26 @@ static esp_lcd_panel_handle_t panelHandle = NULL;
 static uint16_t *panelFbs[2] = {nullptr, nullptr};
 static uint8_t drawBufIdx = 0;
 
+// Staged-redraw state (declared early so /health in displaySetup can read
+// them). See the staging section near renderRadar for how these are used.
+enum StageSlice : uint8_t {
+  SL_IDLE = 0,
+  SL_FILL_A, SL_FILL_B, SL_STATIC, SL_TRAILS_A, SL_TRAILS_B, SL_BLIPS,
+  SL_COPY_A, SL_COPY_B, SL_COPY_C, SL_COPY_D,
+  SL_SWAP,
+  SL_SYNC_A, SL_SYNC_B, SL_SYNC_C, SL_SYNC_D,
+};
+static StageSlice slice = SL_IDLE;
+static uint32_t lastFullCycle = 0;
+#define GLOW_MAX 12
+static int glowX[2][GLOW_MAX], glowY[2][GLOW_MAX];
+static uint8_t glowCount[2] = {0, 0};
+
+// Touch diagnostics for /health — last raw touch coords + what the handler
+// did with them (button hit vs screen cycle).
+static volatile int dbgTouchX = -1, dbgTouchY = -1;
+static char dbgTouchAction[24] = "none";
+
 // Fires once the hardware has genuinely finished consuming the frame buffer
 // content we last handed it via draw_bitmap -- confirmed via Waveshare's own
 // LVGL reference for this exact panel (rgb_lcd_port.cpp/lvgl_port.cpp):
@@ -1455,17 +1475,22 @@ void displaySetup() {
   // Device health snapshot for remote monitoring (slowdown/crash-watch):
   // memory floors, reset reason, frame timings, data-fetch stats.
   server.on("/health", []() {
-    char buf[512];
+    char buf[768];
     snprintf(buf, sizeof(buf),
       "uptime_s: %lu\nreset_reason: %d\nheap_free: %u\nheap_min_free: %u\nheap_largest_block: %u\npsram_free: %u\n"
       "rssi_dbm: %d\nscreen: %u\nfill_us: %lu\ndraw_us: %lu\npush_us: %lu\nframe_interval_ms: %lu\n"
-      "blips: %u\napi_ok: %lu\napi_fail: %lu\n",
+      "blips: %u\napi_ok: %lu\napi_fail: %lu\n"
+      "range_km: %.0f\ndata_age_ms: %lu\nstaged_slice: %d\nlast_cycle_age_ms: %lu\ndraw_buf: %u\nglow0: %u\n"
+      "touch_xy: %d,%d\ntouch_action: %s\n",
       (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (unsigned)ESP.getFreePsram(),
       (int)WiFi.RSSI(), screen,
       (unsigned long)lastFillUs, (unsigned long)lastDrawUs, (unsigned long)lastPushUs,
       (unsigned long)lastFrameIntervalMs,
-      blipCount, (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail);
+      blipCount, (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail,
+      radarMaxKm, (unsigned long)(millis() - lastDataMs),
+      (int)slice, (unsigned long)(millis() - lastFullCycle), (unsigned)drawBufIdx, (unsigned)glowCount[0],
+      (int)dbgTouchX, (int)dbgTouchY, dbgTouchAction);
     server.send(200, "text/plain", buf);
   });
 
@@ -1562,30 +1587,17 @@ void applyBrightness(uint8_t percent) {
 //    arbitrary-timing active-fb erase+rewrite splits the line at the scan
 //    position, which was exactly the reported jitter.
 //
-// Sweep erase position is tracked PER FRAMEBUFFER (prevSweepX/Y[2]): the two
-// driver buffers alternate on every present, so each buffer must remember
-// where ITS OWN line was, or the erase misses and ghosts. Erases RESTORE
-// background from bgFrame (the last completed staged frame, sweep-free) —
-// erasing to BLACK cut gashes through labels/trails.
-enum StageSlice : uint8_t {
-  SL_IDLE = 0,
-  SL_FILL_A, SL_FILL_B, SL_STATIC, SL_TRAILS_A, SL_TRAILS_B, SL_BLIPS,
-  SL_COPY_A, SL_COPY_B, SL_COPY_C, SL_COPY_D,
-  SL_SWAP,
-  SL_SYNC_A, SL_SYNC_B, SL_SYNC_C, SL_SYNC_D,
-};
-static StageSlice slice = SL_IDLE;
-static uint32_t lastFullCycle = 0;
-
-// --- Phosphor afterglow state ---------------------------------------------
-// Instead of a single previous sweep position per fb, keep a short history
-// of recent endpoints per fb. Each tick restores the whole previous set
-// from bgFrame and redraws it dimmest-first behind the new line, giving a
-// CRT-phosphor fading trail. History length 1 degrades to the plain line.
-#define GLOW_MAX 12
-static int glowX[2][GLOW_MAX], glowY[2][GLOW_MAX];  // per-fb, [0] = newest
-static uint8_t glowCount[2] = {0, 0};
-
+// Sweep erase position history is tracked PER FRAMEBUFFER (glowX/glowY/
+// glowCount, declared with the panel state near the top of the file): the
+// two driver buffers alternate on every present, so each buffer must
+// remember where ITS OWN line(s) were, or the erase misses and ghosts.
+// Erases RESTORE background from bgFrame (the last completed staged frame,
+// sweep-free) — erasing to BLACK cut gashes through labels/trails.
+//
+// Phosphor afterglow: instead of a single previous position per fb, each
+// tick restores the whole previous endpoint set from bgFrame and redraws it
+// dimmest-first behind the new line — a CRT-style fading trail. History
+// length 1 degrades to the plain line.
 static uint16_t dim565(uint16_t c, uint8_t num, uint8_t den) {
   uint16_t r = ((c >> 11) & 0x1F) * num / den;
   uint16_t g = ((c >> 5) & 0x3F) * num / den;
@@ -1762,7 +1774,6 @@ void renderRadar(bool justEntered) {
   bool copyPhase = (slice >= SL_COPY_A);  // fbs differ here — no presents allowed
 
   if (tickDue) {
-    lastSweep = now;
     float sweepDeg = fmodf(millis() / (swpSec * 1000.0f / 360.0f), 360.0f);
     double sw = deg2rad(sweepDeg);
     int newX = L.cx + (int)(sin(sw) * L.R);
@@ -1782,6 +1793,12 @@ void renderRadar(bool justEntered) {
       while (vsyncCount == v0 && millis() - tW < 60) { delay(1); }
       sweepGlowTick(act, L.cx, L.cy, newX, newY, cSweepCol, glowK);
     }
+    // Timestamp AFTER the blocking present — not at tick start. The tick's
+    // own frame-completion wait (~46ms) used to count toward the 30ms
+    // throttle, so tickDue was true on every call and staging slices
+    // starved (~20s per content cycle — the "planes frozen / zoom dead"
+    // report). Setting it here frees most of each frame period for slices.
+    lastSweep = millis();
     return;
   }
 
@@ -1855,6 +1872,7 @@ void checkTouch() {
 
   uint16_t x, y;
   touch.readData(&x, &y);
+  dbgTouchX = x; dbgTouchY = y;
 
   if (millis() - lastTouchMs < 400) return;  // debounce, matches the other boards
   lastTouchMs = millis();
@@ -1877,6 +1895,7 @@ void checkTouch() {
       radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
       if (configMutex) xSemaphoreGive(configMutex);
       markRangeDirty();
+      snprintf(dbgTouchAction, sizeof(dbgTouchAction), "zoom+ rng=%d", (int)radarMaxKm);
       Serial.printf("[lcd7b] Range increased: %d km\n", (int)radarMaxKm);
       return;
     }
@@ -1885,11 +1904,13 @@ void checkTouch() {
       radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
       if (configMutex) xSemaphoreGive(configMutex);
       markRangeDirty();
+      snprintf(dbgTouchAction, sizeof(dbgTouchAction), "zoom- rng=%d", (int)radarMaxKm);
       Serial.printf("[lcd7b] Range decreased: %d km\n", (int)radarMaxKm);
       return;
     }
   }
 
   // Default: cycle to next screen
+  snprintf(dbgTouchAction, sizeof(dbgTouchAction), "cycle scr=%d", (screen + 1) % LCD7B_NUM_SCREENS);
   screen = (screen + 1) % LCD7B_NUM_SCREENS;
 }
