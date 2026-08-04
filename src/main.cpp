@@ -87,6 +87,8 @@ void setup() {
   nightStartHr = prefs.getUChar("nd_start", nightStartHr);
   nightEndHr = prefs.getUChar("nd_end", nightEndHr);
   nightBrightPct = prefs.getUChar("nd_bright", nightBrightPct);
+  nightlyRebootOn = prefs.getBool("nr_on", nightlyRebootOn);
+  nightlyRebootHr = prefs.getUChar("nr_hr", nightlyRebootHr);
   autoCycleOn = prefs.getBool("acycle", autoCycleOn);
   autoCycleSec = prefs.getUShort("acyclesec", autoCycleSec);
   showMap = prefs.getBool("showmap", showMap);
@@ -100,6 +102,7 @@ void setup() {
   // Create mutexes before the task (task uses them)
   dataMutex = xSemaphoreCreateMutex();
   configMutex = xSemaphoreCreateMutex();
+  httpsMutex = xSemaphoreCreateMutex();
 
   // Start web config server
   initWebServer();
@@ -153,6 +156,21 @@ void loop() {
         applyBrightness((uint8_t)target);
         Serial.printf("[dim] night=%d -> backlight %d%%\n", night, target);
       }
+    }
+  }
+
+  // Nightly reboot safety net (off by default, web-configurable). Flushes
+  // deferred config first. Guarded against reboot loops by requiring 1h
+  // uptime and once-per-day via tm_yday.
+  if (nightlyRebootOn && millis() > 3600000UL && time(nullptr) > 1700000000) {
+    time_t t = time(nullptr); struct tm lt; localtime_r(&t, &lt);
+    static int lastRebootYday = -1;
+    if (lt.tm_hour == (int)nightlyRebootHr && lt.tm_yday != lastRebootYday) {
+      lastRebootYday = lt.tm_yday;
+      Serial.println("[nightly] scheduled reboot");
+      flushConfigNow();
+      delay(200);
+      ESP.restart();
     }
   }
 

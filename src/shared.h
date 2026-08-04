@@ -77,6 +77,11 @@ extern bool     nightDimOn;
 extern uint8_t  nightStartHr;      // dim begins (0-23)
 extern uint8_t  nightEndHr;        // dim ends (0-23)
 extern uint8_t  nightBrightPct;    // night backlight level 1-100
+// Nightly reboot safety net: long-haul heap fragmentation is mitigated but
+// not eliminated; an optional scheduled restart keeps multi-week uptimes
+// clean. Deferred config is flushed before restarting.
+extern bool     nightlyRebootOn;   // default off
+extern uint8_t  nightlyRebootHr;   // hour to reboot at (0-23, default 4)
 bool isNightNow();                 // true between 19:00 and 07:00 local
 extern uint16_t colSweep;
 extern uint16_t colBlip;           // blip color once the sweep has passed
@@ -239,6 +244,13 @@ void wifiMaintain();   // non-blocking reconnect/AP-fallback state machine — c
 void markRangeDirty();  // defer NVS persistence of radarMaxKm (see configMaintain)
 void configMaintain();  // commits deferred config writes after idle — call every loop()
 extern volatile bool configDirty;  // set by /save — full config persistence is deferred
+void flushConfigNow();             // immediately flush any deferred config writes (pre-reboot)
+
+// Serializes OUTBOUND HTTPS (adsb.lol, adsbdb.com, Open-Meteo) across cores
+// — each TLS handshake needs ~40-50KB of contiguous internal heap, and
+// concurrent handshakes + page serving nearly OOM'd the device once
+// (heap_min_free hit 488 bytes before a task-watchdog reset).
+extern SemaphoreHandle_t httpsMutex;
 bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bool allowFetch = true);
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut);

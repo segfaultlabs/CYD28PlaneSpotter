@@ -76,6 +76,9 @@ bool     nightDimOn = false;
 uint8_t  nightStartHr = 22;
 uint8_t  nightEndHr = 7;
 uint8_t  nightBrightPct = 15;
+bool     nightlyRebootOn = false;
+uint8_t  nightlyRebootHr = 4;
+SemaphoreHandle_t httpsMutex = NULL;
 
 // Fixed day window for the weather widget (07:00-19:00 local). The
 // configurable night-dim schedule is separate (nightStartHr/nightEndHr).
@@ -213,6 +216,8 @@ static void configPersistAll() {
   prefs.putUChar("nd_start", nightStartHr);
   prefs.putUChar("nd_end", nightEndHr);
   prefs.putUChar("nd_bright", nightBrightPct);
+  prefs.putBool("nr_on", nightlyRebootOn);
+  prefs.putUChar("nr_hr", nightlyRebootHr);
   prefs.putBool("acycle", autoCycleOn);
   prefs.putUShort("acyclesec", autoCycleSec);
   prefs.putBool("showmap", showMap);
@@ -256,6 +261,19 @@ void configMaintain() {
     configPersistAll();
     Serial.println("[cfg] full config persisted (deferred)");
     displayPanelSync();
+  }
+}
+
+// Immediately flush any deferred config writes — used before planned
+// reboots (/reboot route, nightly reboot) so nothing is lost.
+void flushConfigNow() {
+  if (rangeDirty) {
+    rangeDirty = false;
+    prefs.putFloat("range", radarMaxKm);
+  }
+  if (configDirty) {
+    configDirty = false;
+    configPersistAll();
   }
 }
 
@@ -368,6 +386,7 @@ bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bo
 
   if (!allowFetch) return false;  // cache-only lookup — skip the live HTTP call
 
+  if (httpsMutex) xSemaphoreTake(httpsMutex, portMAX_DELAY);
   WiFiClientSecure client; client.setInsecure();
   HTTPClient https; https.setReuse(false);
   String url = String("https://api.adsbdb.com/v0/callsign/") + callsign;
@@ -399,6 +418,7 @@ bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bo
   } else {
     Serial.printf("[route] %s https.begin() failed\n", callsign);
   }
+  if (httpsMutex) xSemaphoreGive(httpsMutex);
 
   int replaceIdx = 0;
   uint32_t oldest = 0xFFFFFFFF;
@@ -466,16 +486,18 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   String url = urlBuf;
   Serial.printf("[fetch] GET %s (WiFi RSSI=%d dBm)\n", url.c_str(), WiFi.RSSI());
 
+  if (httpsMutex) xSemaphoreTake(httpsMutex, portMAX_DELAY);
   if (!https.begin(client, url)) {
     Serial.printf("[fetch] https.begin() failed, heap=%u\n", ESP.getFreeHeap());
     stats.lastFetchStage = 1;
+    if (httpsMutex) xSemaphoreGive(httpsMutex);
     stats.requestsFail++; return false;
   }
   uint32_t t0 = millis();
   int code = https.GET();
   stats.lastHttpCode = code;
   Serial.printf("[fetch] HTTP code=%d in %lums, heap=%u\n", code, millis() - t0, ESP.getFreeHeap());
-  if (code != HTTP_CODE_OK) { https.end(); stats.lastFetchStage = 2; stats.requestsFail++; return false; }
+  if (code != HTTP_CODE_OK) { https.end(); if (httpsMutex) xSemaphoreGive(httpsMutex); stats.lastFetchStage = 2; stats.requestsFail++; return false; }
 
   JsonDocument filter(PsRamAllocator::instance());
   JsonObject fac = filter["ac"].to<JsonArray>().add<JsonObject>();
@@ -498,6 +520,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   PsBufStream out(payloadBuf, PAYLOAD_CAP);
   int len = https.writeToStream(&out);
   https.end();
+  if (httpsMutex) xSemaphoreGive(httpsMutex);
   Serial.printf("[fetch] payload=%d bytes (psram), heap after read=%u\n", len, ESP.getFreeHeap());
   stats.lastPayloadBytes = len > 0 ? (uint32_t)len : 0;
   if (len <= 0) { stats.lastFetchStage = 3; stats.requestsFail++; return false; }
@@ -669,7 +692,11 @@ void dataFetcherTask(void* param) {
           // in over a couple of minutes for new aircraft.
           static uint8_t routeCycle = 0;
           if ((routeCycle++ % 3) == 0) {
-            const int ROUTE_FETCH_BUDGET = 6;
+            // Live-fetch budget kept small: every adsbdb call is a ~50KB
+            // transient TLS allocation, and bursts of these + page serves
+            // nearly OOM'd the device once (heap_min_free hit 488 bytes
+            // before a task-watchdog reset).
+            const int ROUTE_FETCH_BUDGET = 3;
             int routeFetchesUsed = 0;
             for (int i = 0; i < locBlipCount && routeFetchesUsed < ROUTE_FETCH_BUDGET; i++) {
               if (locBlips[i].hasRoute) continue;
@@ -705,12 +732,14 @@ bool fetchWeather() {
 
   WiFiClientSecure client; client.setInsecure(); HTTPClient https; https.setReuse(false);
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(hLat, 4) + "&longitude=" + String(hLon, 4) + "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code";
-  if (!https.begin(client, url)) { Serial.println("[weather] https.begin() failed"); return false; }
+  if (httpsMutex) xSemaphoreTake(httpsMutex, portMAX_DELAY);
+  if (!https.begin(client, url)) { Serial.println("[weather] https.begin() failed"); if (httpsMutex) xSemaphoreGive(httpsMutex); return false; }
   uint32_t t0 = millis();
   int code = https.GET();
   Serial.printf("[weather] HTTP code=%d in %lums, heap=%u\n", code, millis() - t0, ESP.getFreeHeap());
-  if (code != HTTP_CODE_OK) { https.end(); return false; }
+  if (code != HTTP_CODE_OK) { https.end(); if (httpsMutex) xSemaphoreGive(httpsMutex); return false; }
   String payload = https.getString(); https.end();
+  if (httpsMutex) xSemaphoreGive(httpsMutex);
 
   JsonDocument doc(PsRamAllocator::instance());
   DeserializationError jerr = deserializeJson(doc, payload);
@@ -969,6 +998,7 @@ void initWebServer() {
     float swpSec, cNear; int16_t cVr;
     bool sApt, sKey, sComp, glowOn; uint8_t glowLen;
     bool ndOn; uint8_t ndStart, ndEnd, ndBright;
+    bool nrOn; uint8_t nrHr;
     bool aCycOn; uint16_t aCycSec;
     bool sMap; uint16_t cMapCol;
     uint16_t cSweep, cBlip, cBlipHi, cRings, cAirpt, cTrDep, cTrArr, cTrOver;
@@ -982,6 +1012,7 @@ void initWebServer() {
     sApt = showAirports; sKey = showTrailKey; sComp = showCompass;
     glowOn = sweepGlow; glowLen = sweepGlowLen;
     ndOn = nightDimOn; ndStart = nightStartHr; ndEnd = nightEndHr; ndBright = nightBrightPct;
+    nrOn = nightlyRebootOn; nrHr = nightlyRebootHr;
     aCycOn = autoCycleOn; aCycSec = autoCycleSec;
     cSweep = colSweep; cBlip = colBlip; cBlipHi = colBlipHi; cRings = colRings; cAirpt = colAirport;
     cTrDep = colTrailDep; cTrArr = colTrailArr; cTrOver = colTrailOver;
@@ -1235,6 +1266,15 @@ void initWebServer() {
     <input type="number" name="nd_end" id="nd_end" min="0" max="23" value=")rawliteral" + String(ndEnd) + R"rawliteral(">
     <label for="nd_bright">Night brightness &mdash; <span id="ndBrightVal">)rawliteral" + String(ndBright) + R"rawliteral(</span>%</label>
     <input type="range" name="nd_bright" id="nd_bright" min="1" max="100" value=")rawliteral" + String(ndBright) + R"rawliteral(" oninput="document.getElementById('ndBrightVal').textContent=this.value">
+    <div class="switch-row">
+      <label for="nr_on">Nightly reboot (long-uptime safety net)</label>
+      <label class="switch">
+        <input type="checkbox" id="nr_on")rawliteral" + String(nrOn ? " checked" : "") + R"rawliteral(>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <label>Reboot at hour (0-23)</label>
+    <input type="number" name="nr_hr" id="nr_hr" min="0" max="23" value=")rawliteral" + String(nrHr) + R"rawliteral(">
     <div class="section-hd">Data Fetch</div>
     <label>Aircraft poll interval (seconds, 5-600)</label>
     <input type="number" name="fetchsec" id="fetchsec" min="5" max="600" value=")rawliteral" + String(fetchSec) + R"rawliteral(">
@@ -1438,6 +1478,8 @@ function save(e){
          '&nd_start='+encodeURIComponent(document.getElementById('nd_start').value)+
          '&nd_end='+encodeURIComponent(document.getElementById('nd_end').value)+
          '&nd_bright='+encodeURIComponent(document.getElementById('nd_bright').value)+
+         '&nr_on='+(document.getElementById('nr_on').checked?'1':'0')+
+         '&nr_hr='+encodeURIComponent(document.getElementById('nr_hr').value)+
          '&acycle='+(document.getElementById('acycle').checked?'1':'0')+
          '&acyclesec='+encodeURIComponent(document.getElementById('acyclesec').value)+
          '&showmap='+(document.getElementById('showmap').checked?'1':'0')+
@@ -1566,6 +1608,9 @@ function doReboot(){
     if (newNdEnd > 23) newNdEnd = 23;
     if (newNdBright < 1) newNdBright = 1;
     if (newNdBright > 100) newNdBright = 100;
+    bool newNrOn = server.hasArg("nr_on") ? (server.arg("nr_on") == "1") : nightlyRebootOn;
+    uint8_t newNrHr = server.hasArg("nr_hr") ? (uint8_t)server.arg("nr_hr").toInt() : nightlyRebootHr;
+    if (newNrHr > 23) newNrHr = 23;
 
     // WiFi network slots (optional). strncpy under configMutex since
     // wifiMaintain() reads the slots on Core 1; NVS writes stay outside.
@@ -1665,6 +1710,8 @@ function doReboot(){
     nightStartHr = newNdStart;
     nightEndHr = newNdEnd;
     nightBrightPct = newNdBright;
+    nightlyRebootOn = newNrOn;
+    nightlyRebootHr = newNrHr;
     if (configMutex) xSemaphoreGive(configMutex);
     applyInvertColors(newInvert);
     applyBrightness(newBrightness);
@@ -1692,8 +1739,7 @@ function doReboot(){
   server.on("/reboot", HTTP_POST, []() {
     // Flush deferred config writes before restarting, or a save made within
     // the last ~2s (configMaintain's idle window) would be silently lost.
-    if (configDirty) { configDirty = false; configPersistAll(); }
-    if (rangeDirty) { rangeDirty = false; prefs.putFloat("range", radarMaxKm); }
+    flushConfigNow();
     server.send(200, "text/plain", "Rebooting...");
     delay(500);
     ESP.restart();
