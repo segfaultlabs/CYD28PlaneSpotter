@@ -548,6 +548,7 @@ static void plotLine(uint16_t *dst, int x0, int y0, int x1, int y1, uint16_t col
 // next — drawing into a buffer mid-scan is what tearing looks like.
 void pushFrame() {
   esp_lcd_panel_draw_bitmap(panelHandle, 0, 0, LCD_W, LCD_H, panelFbs[drawBufIdx]);
+  crashMarker = 50;  // crash forensics: blocked in the frame-completion wait
   waitFrameDone();
   drawBufIdx ^= 1;
   directGfx->setBuffer(panelFbs[drawBufIdx]);
@@ -1572,12 +1573,12 @@ void displaySetup() {
   server.on("/health", []() {
     char buf[768];
     snprintf(buf, sizeof(buf),
-      "uptime_s: %lu\nreset_reason: %d\nheap_free: %u\nheap_min_free: %u\nheap_largest_block: %u\npsram_free: %u\n"
+      "uptime_s: %lu\nreset_reason: %d\nprev_boot_phase: %lu\nheap_free: %u\nheap_min_free: %u\nheap_largest_block: %u\npsram_free: %u\n"
       "rssi_dbm: %d\nscreen: %u\nfill_us: %lu\ndraw_us: %lu\npush_us: %lu\nframe_interval_ms: %lu\n"
       "blips: %u\napi_ok: %lu\napi_fail: %lu\nfetch_stage: %u\nfetch_http: %d\nfetch_bytes: %lu\nfetch_head: %s\n"
       "top5: %u\nnearest_valid: %d\nnearest_cs: %s\nrange_km: %.0f\ndata_age_ms: %lu\nstaged_slice: %d\nlast_cycle_age_ms: %lu\ndraw_buf: %u\nglow0: %u\n"
       "touch_xy: %d,%d\ntouch_action: %s\n",
-      (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
+      (unsigned long)(millis() / 1000), (int)esp_reset_reason(), (unsigned long)prevBootPhase,
       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (unsigned)ESP.getFreePsram(),
       (int)WiFi.RSSI(), screen,
       (unsigned long)lastFillUs, (unsigned long)lastDrawUs, (unsigned long)lastPushUs,
@@ -1735,6 +1736,7 @@ void runStagingSlice(const RadarLayout &L) {
   const int bandH = LCD_H / 8;  // copy/sync band height (8 slices per fb copy)
   const size_t bandBytes = (size_t)bandH * LCD_W * sizeof(uint16_t);
   Arduino_Canvas *stg = stagingCanvas[stgRenderIdx];
+  crashMarker = 10 + slice;  // crash forensics: which slice we were in
   switch (slice) {
     case SL_FILL_A: case SL_FILL_B: case SL_FILL_C: case SL_FILL_D: {
       // Raw memset in quarters (~10ms each) — smaller slices keep the sweep

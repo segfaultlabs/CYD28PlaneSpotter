@@ -15,6 +15,11 @@
 void setup() {
   Serial.begin(115200);
 
+  // Capture the previous boot's loop-phase marker before anything
+  // overwrites it (crash forensics for watchdog resets — see /health).
+  prevBootPhase = crashMarker;
+  crashMarker = 0;
+
   displaySetup();  // board-specific: touch/display/sprite/canvas init + splash
 
   for (int i = 0; i < ROUTE_CACHE_SIZE; i++) routeCache[i].valid = false;
@@ -133,13 +138,16 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+  crashMarker = 0;  // loop alive
 
   // WiFi health — non-blocking multi-network reconnect + fallback setup AP
   // (the radar keeps running on stale data during outages)
+  crashMarker = 1;
   wifiMaintain();
 
   // Day/night auto-dim: switch backlight between the configured day level
   // (brightness) and night level on a schedule, checked every 30s.
+  crashMarker = 2;
   static uint32_t lastDimCheck = 0;  static int lastAppliedBright = -1;
   if (!nightDimOn) {
     lastAppliedBright = -1;  // force re-apply if re-enabled
@@ -162,6 +170,7 @@ void loop() {
   // Nightly reboot safety net (off by default, web-configurable). Flushes
   // deferred config first. Guarded against reboot loops by requiring 1h
   // uptime and once-per-day via tm_yday.
+  crashMarker = 3;
   if (nightlyRebootOn && millis() > 3600000UL && time(nullptr) > 1700000000) {
     time_t t = time(nullptr); struct tm lt; localtime_r(&t, &lt);
     static int lastRebootYday = -1;
@@ -175,6 +184,7 @@ void loop() {
   }
 
   // Deferred config persistence (NVS writes stay out of the interactive path)
+  crashMarker = 4;
   configMaintain();
 
   // Auto-cycle (kiosk mode): rotate screens on a timer; any touch pauses
@@ -188,12 +198,15 @@ void loop() {
   }
 
   // Weather fetch still runs in loop (it's infrequent, every 10 min)
+  crashMarker = 5;
   if (!firstWeatherDone || now - lastWeatherPoll >= WEATHER_INTERVAL_MS) {
     if (WiFi.status() == WL_CONNECTED) fetchWeather();
     lastWeatherPoll = now; firstWeatherDone = true;
   }
 
+  crashMarker = 6;
   checkTouch();
 
+  crashMarker = 7;
   render();
 }

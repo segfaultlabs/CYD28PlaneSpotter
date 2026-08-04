@@ -11,6 +11,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <esp_attr.h>
+#include <esp_task_wdt.h>
 #include "config.env"
 
 // ArduinoJson allocator that puts the document pool in PSRAM. The repeated
@@ -79,6 +81,12 @@ uint8_t  nightBrightPct = 15;
 bool     nightlyRebootOn = false;
 uint8_t  nightlyRebootHr = 4;
 SemaphoreHandle_t httpsMutex = NULL;
+
+// Crash forensics (RTC RAM persists across watchdog resets): loop writes
+// phase markers here; prevBootPhase captures the previous boot's marker at
+// startup so /health can report where a watchdog fired.
+RTC_NOINIT_ATTR volatile uint32_t crashMarker;
+uint32_t prevBootPhase = 0;
 
 // Fixed day window for the weather widget (07:00-19:00 local). The
 // configurable night-dim schedule is separate (nightStartHr/nightEndHr).
@@ -1762,7 +1770,15 @@ function doReboot(){
   }, []() {
     HTTPUpload &upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
+      crashMarker = 60;  // crash forensics: OTA in progress
       Serial.printf("[ota] Update start: %s\n", upload.filename.c_str());
+      // Flash writes during the upload stall cache-off past the task
+      // watchdog timeout (reset_reason 6 mid-OTA). Reconfigure TWDT to a
+      // non-fatal long timeout and suspend the fetch task so TLS traffic
+      // doesn't contend for the flash bus. Reboot follows on success.
+      esp_task_wdt_config_t twdt = { .timeout_ms = 300000, .idle_core_mask = 0, .trigger_panic = false };
+      esp_task_wdt_reconfigure(&twdt);
+      if (fetchTaskHandle) vTaskSuspend(fetchTaskHandle);
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
         Update.printError(Serial);
       }
@@ -1771,6 +1787,7 @@ function doReboot(){
         Update.printError(Serial);
       }
     } else if (upload.status == UPLOAD_FILE_END) {
+      crashMarker = 0;  // OTA done (reboot follows via the response handler)
       if (Update.end(true)) {
         Serial.printf("[ota] Update success: %u bytes\n", upload.totalSize);
       } else {

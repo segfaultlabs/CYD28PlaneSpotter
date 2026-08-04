@@ -251,6 +251,15 @@ void flushConfigNow();             // immediately flush any deferred config writ
 // concurrent handshakes + page serving nearly OOM'd the device once
 // (heap_min_free hit 488 bytes before a task-watchdog reset).
 extern SemaphoreHandle_t httpsMutex;
+
+// Crash forensics: RTC RAM survives watchdog/soft resets. The loop writes a
+// phase marker here constantly; at the next boot we read back WHERE the
+// previous boot was when the watchdog fired and expose it via /health
+// (prev_boot_phase). Codes: 1 wifiMaintain, 2 dim-check, 3 nightly-check,
+// 4 configMaintain, 5 weather, 6 checkTouch, 7 render, 10+slice staged
+// slice, 50 pushFrame wait, 60 OTA.
+extern volatile uint32_t crashMarker;
+extern uint32_t prevBootPhase;
 bool getFlightInfo(const char* callsign, char* dep, char* arr, char* airline, bool allowFetch = true);
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut);
