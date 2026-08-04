@@ -1115,3 +1115,16 @@ function doOta(e){
   server.begin();
   Serial.println("Web server started on http://" + WiFi.localIP().toString() + "/");
 }
+
+// Serves all HTTP requests from Core 0 (started in main.cpp's setup).
+// Core 1 (rendering/touch) never calls handleClient(), so config-page
+// visits, /health polls and OTA uploads no longer steal time from the
+// render path. WebServer is single-threaded per instance but not pinned
+// to a core; all routes are registered in initWebServer() before this
+// task starts, and handlers only touch shared state under configMutex.
+void webServerTask(void* param) {
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}

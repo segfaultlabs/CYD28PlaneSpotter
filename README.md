@@ -198,12 +198,14 @@ Ideas noted for future work, not yet implemented:
 
 Everything user-facing currently runs on Core 1 (rendering, touch, web server, OTA) while Core 0 sits ~90% idle between 10s data fetches. Ordered by value/effort:
 
-- **Move the web server to Core 0** — run `server.handleClient()` in its own FreeRTOS task on Core 0. Today every HTTP request (config page, `/health` polls, OTA uploads) directly competes with rendering on Core 1. Big perceived-smoothness win for little code. (S)
-- **Precompute trail polar coordinates on Core 0** — trail projection (distance/bearing trig per sample per trail) is the single biggest render cost (up to ~230ms/cycle with full trails). Do it once per appended sample in the fetch task and cache `sin(bearing)`/`cos(bearing)`+distance per point; drawing becomes 2 multiplies per point. (M)
-- **Incremental trail drawing** — each cycle only the newest segment per trail is new; append just that instead of re-rendering up to 1800 segments per trail every 500ms. Needs care on range/screen change (full redraw then). (M)
+- ~~**Move the web server to Core 0**~~ — **DONE** (webServerTask; HTTP no longer competes with rendering).
+- ~~**Precompute trail polar coordinates**~~ — **DONE** differently and better: polar (dist + bearing sin/cos) is computed once per sample at append, not per redraw; no Core-0 sync needed. Trail redraw is now trig-free.
+- ~~**Raw memset fills**~~ — **DONE** (modest; PSRAM write bandwidth-bound).
+- **Incremental trail drawing** — each cycle only the newest segment per trail is new; append just that instead of re-rendering all segments every 500ms. Needs care on range/screen change (full redraw then). (M)
 - **Static background layer** — rings/axes/compass/airports/buttons only change on range/screen/config change; render once into a background buffer and memcpy (~50ms) instead of redrawing + clearing every cycle. (M)
-- **`esp_async_memcpy` investigation** — the S3's GDMA has a memory-to-memory mode that could offload the 1.2MB band copies/fills from the CPU; check PSRAM support + contention with the LCD scan-out DMA before adopting. (S)
+- **`esp_async_memcpy` — RESEARCHED, rejected**: supports PSRAM but per-transfer overhead (descriptor alloc + cache msync) makes it a wash for our band-copy sizes; PSRAM→PSRAM is bus-bound (~26MB/s) either way. Raw GDMA with reused descriptors (~80MB/s) remains an option if a big copy ever becomes the bottleneck.
 - **Clock as a tiny region update** — the 1Hz header clock currently forces full cycles on static screens; updating just the clock's bounding box would let fully-static frames skip redraws entirely. (S)
+- **Phase-3 levers already in the v3 config**: 64B data-cache line (+49% PSRAM read throughput, measured) and 120MHz PSRAM (1.5× bus). These are the real hardware unlocks — everything else is working around the ~160MB/s shared-bus wall.
 - **Design principle for all new settings** — every configurable feature gets BOTH a web UI control and (once the touch settings screen lands) a physical-UI control. No device-side-only knobs.
 - **Arrivals/departures board per nearby airport** — a dedicated screen (one per airport, e.g. GMP and ICN for the primary dev setup) listing upcoming arrivals and departures at that specific airport, rather than the existing Top 5/Target Intel screens which are organized by distance from home location instead of by airport.
 - **On-hardware touch calibration for the JC4832W535** — the current touch offsets are a placeholder spanning the full native panel range; `checkTouch()` logs raw coordinates to Serial specifically so real calibration data can be gathered and the offsets tuned.

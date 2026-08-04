@@ -30,17 +30,20 @@ uint8_t GT911_Touch::readReg8(uint16_t reg) {
 }
 
 void GT911_Touch::writeReg8(uint16_t reg, uint8_t value) {
+    if (i2cMutex) xSemaphoreTake(i2cMutex, portMAX_DELAY);
     Wire.beginTransmission(ADDR);
     Wire.write((uint8_t)(reg >> 8));
     Wire.write((uint8_t)(reg & 0xFF));
     Wire.write(value);
     Wire.endTransmission();
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
 }
 
 // Returns the number of bytes actually read — callers must check this before
 // trusting buf; a short/failed I2C transaction otherwise silently leaves the
 // remainder of an uninitialized caller buffer as stack garbage.
 uint8_t GT911_Touch::readRegN(uint16_t reg, uint8_t *buf, uint8_t len) {
+    if (i2cMutex) xSemaphoreTake(i2cMutex, portMAX_DELAY);
     Wire.beginTransmission(ADDR);
     Wire.write((uint8_t)(reg >> 8));
     Wire.write((uint8_t)(reg & 0xFF));
@@ -51,6 +54,7 @@ uint8_t GT911_Touch::readRegN(uint16_t reg, uint8_t *buf, uint8_t len) {
     for (; n < len && Wire.available(); n++) {
         buf[n] = Wire.read();
     }
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
     return n;
 }
 

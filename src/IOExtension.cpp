@@ -1,10 +1,20 @@
 #include "IOExtension.h"
 
+// Serializes access to the shared I2C bus (IO expander + GT911 touch).
+// Needed because the web server task (Core 0) can trigger setBacklight()
+// via /save while the render loop (Core 1) is polling the touch controller
+// — raw Wire transactions are not thread-safe. Created in begin().
+SemaphoreHandle_t i2cMutex = NULL;
+
 bool IOExtension::begin() {
+    if (!i2cMutex) i2cMutex = xSemaphoreCreateMutex();
     uint8_t data[2] = {REG_MODE, 0xFF};  // all 8 IOs -> output mode
+    if (i2cMutex) xSemaphoreTake(i2cMutex, portMAX_DELAY);
     Wire.beginTransmission(ADDR);
     Wire.write(data, sizeof(data));
-    return Wire.endTransmission() == 0;
+    bool ok = Wire.endTransmission() == 0;
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
+    return ok;
 }
 
 void IOExtension::setOutput(uint8_t pin, bool value) {
@@ -12,9 +22,11 @@ void IOExtension::setOutput(uint8_t pin, bool value) {
     else outputState &= ~(1 << pin);
 
     uint8_t data[2] = {REG_OUTPUT, outputState};
+    if (i2cMutex) xSemaphoreTake(i2cMutex, portMAX_DELAY);
     Wire.beginTransmission(ADDR);
     Wire.write(data, sizeof(data));
     Wire.endTransmission();
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
 }
 
 void IOExtension::setBacklight(uint8_t percent) {
@@ -33,7 +45,9 @@ void IOExtension::setBacklight(uint8_t percent) {
     uint8_t scaled = (uint8_t)(duty * (255 / 100.0f));
 
     uint8_t data[2] = {0x05, scaled};  // PWM register
+    if (i2cMutex) xSemaphoreTake(i2cMutex, portMAX_DELAY);
     Wire.beginTransmission(ADDR);
     Wire.write(data, sizeof(data));
     Wire.endTransmission();
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
 }

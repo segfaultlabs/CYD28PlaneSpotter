@@ -179,6 +179,7 @@ void dataFetcherTask(void* param);
 bool fetchWeather();
 const char* lookupAirline(const char* callsign);
 void initWebServer();
+void webServerTask(void* param);  // runs server.handleClient() on Core 0 (see main.cpp)
 
 // ---------------------------------------------------------------------------
 // Display interface, implemented once per board in display_cyd.cpp /

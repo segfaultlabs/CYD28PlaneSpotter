@@ -204,6 +204,39 @@ high-pclk stability, but both need a custom sdkconfig.
   timings, API stats — for remote slowdown/crash monitoring.
 **Status: kept, verified on hardware.**
 
+### 18. Core performance pass (web→Core0, trail polar cache, memset fills) + sweep-artifact fix
+Deep-dive research (Espressif docs/FAQ, esp_lcd v5.5.5 driver source,
+project-x51 and Qiita S3 memory benchmarks) established the ground rules:
+octal PSRAM @80MHz is ~160MB/s theoretical / ~125MB/s practical read /
+~30MB/s write, SHARED with the LCD scan-out (20MHz pclk x 2B = 40MB/s) and
+flash. SIMD (dsps_*_aes3, 128-bit TIE) only helps internal RAM; GDMA M2M
+(esp_async_memcpy) supports PSRAM but per-transfer overhead + cache msync
+makes it a wash for our band copies; the bounce-buffer refill is a CPU
+memcpy in the GDMA EOF ISR (~26MB/s of hidden CPU at 20MHz). So the wins
+are algorithmic, not hardware-offload:
+- **Web server moved to Core 0** (`webServerTask`): config page, /health
+  polls and OTA no longer steal Core 1 render time. WebServer is single-
+  threaded per instance but not core-pinned (verified in its source);
+  routes are registered before the task starts. Added `i2cMutex` around
+  all Wire transactions (IOExtension + GT911) since /save→setBacklight
+  now runs on Core 0 while Core 1 polls touch.
+- **Trail polar cache**: each trail sample's distance + bearing sin/cos is
+  computed ONCE at append (trailProject) instead of every sample every
+  500ms redraw — the single biggest render cost eliminated (~200ms/frame
+  at full trails). Cache is range/layout-independent; reprojected only if
+  home location changes. Shift-on-full now uses memmove on all 5 arrays.
+- **Raw memset fills** instead of canvas fillScreen (~65ms vs ~74ms per
+  full frame; PSRAM write bandwidth is the wall, so this is a modest gain).
+- **Sweep-artifact fix (regression from the restoreLine fuzzy-label fix)**:
+  two causes — (a) bgFrame had the sweep line baked into it, so erases
+  resurrected a ghost line; fixed by never drawing the sweep into staged
+  frames (position still recorded for erase seeding). (b) restoreLine's
+  Bresenham didn't pixel-match Arduino_GFX's drawLine, leaving un-erased
+  specks; fixed with plotLine() — the sweep is now drawn AND erased with
+  the identical rasterizer (linePixels), bypassing the canvas for sweep
+  writes entirely.
+**Status: kept, verified on hardware.**
+
 ### 17. pclk 30MHz via 120MHz PSRAM (phase 3) — build solved, USB flash pending
 The 120MHz-PSRAM recipe via pioarduino's HybridCompile. Three attempts:
 1. `board_build.f_flash = 120000000L` → build passed `--flash-freq 120m` to

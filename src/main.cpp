@@ -88,6 +88,18 @@ void setup() {
     &fetchTaskHandle,  // Handle
     0                  // Core 0 — leaves Core 1 free for rendering
   );
+
+  // Web server on Core 0 too (see webServerTask in data.cpp) — HTTP requests
+  // no longer compete with rendering on Core 1.
+  xTaskCreatePinnedToCore(
+    webServerTask,     // Function
+    "WebSrv",          // Name
+    8192,              // Stack (8 KB — HTTP parsing + config page)
+    NULL,              // Parameter
+    1,                 // Priority
+    NULL,              // Handle
+    0                  // Core 0
+  );
 }
 
 void loop() {
@@ -103,9 +115,6 @@ void loop() {
   }
 
   checkTouch();
-
-  // Serve web config requests
-  server.handleClient();
 
   render();
 }

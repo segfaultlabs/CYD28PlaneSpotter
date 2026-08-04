@@ -3,6 +3,12 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
+// Serializes access to the shared I2C bus (IO expander + GT911) across
+// cores — defined in IOExtension.cpp, created in IOExtension::begin().
+extern SemaphoreHandle_t i2cMutex;
 
 // Small I2C GPIO-expander on the ESP32-S3-Touch-LCD-7B (Waveshare's own
 // examples call it "IO_EXTENSION"; likely a CH32V003 running expander

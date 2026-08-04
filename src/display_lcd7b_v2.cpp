@@ -182,9 +182,54 @@ static const uint8_t AIRPORT_COUNT = sizeof(AIRPORTS) / sizeof(AIRPORTS[0]);
 // cached, so vertical-rate-vs-airport-proximity is the most consistent
 // signal available on every blip. Thresholds are runtime-configurable via
 // the web UI (classNearKm / classMaxAltFt / classVrateFpm).
+// Flight-path trace history (Radar screen, showTraces toggle). Keyed by
+// callsign rather than blips[] array index, since that index isn't stable
+// between fetch cycles — a trail must follow one aircraft, not one array
+// slot. Lives here (not shared.h/data.cpp) since it's purely a rendering
+// concern local to this board's Radar screen.
+// 1800 samples ~= 15-30 min of history at this screen's 1-2Hz full-redraw
+// sampling rate -- long enough that no realistic single viewing session
+// should ever see a trail age out by hitting this cap; only true staleness
+// (the trailStaleSec config, aircraft actually gone) should ever clear a trail. Backed
+// by PSRAM (ps_malloc, lazily allocated per slot and kept for the life of
+// the program) rather than a fixed struct member -- 1800*16 bytes*20 slots
+// is ~560KB, too big to want living in internal SRAM/.bss alongside
+// everything else, but trivial against this board's 8MB PSRAM.
+#define TRAIL_LEN 1800
+#define TRAIL_SLOTS MAX_BLIPS
+struct TrailHistory {
+  char callsign[10] = {0};
+  double *lat = nullptr, *lon = nullptr;  // ps_malloc'd on first use, kept across resets
+  // Polar cache (distance + bearing sin/cos vs home), computed ONCE per
+  // sample at append time. Projection used to be recomputed for every
+  // sample on every 500ms redraw — 1800 samples x N trails of software
+  // double-trig, hundreds of ms per frame. distKm/sinB/cosB are range- and
+  // layout-independent, so a cached sample never needs recomputing unless
+  // home location itself changes (see cacheHomeLat/Lon below).
+  float *distKm = nullptr, *sinB = nullptr, *cosB = nullptr;
+  uint16_t count = 0;  // TRAIL_LEN > 255, so this can't be uint8_t
+  uint32_t lastSeenMs = 0;
+  // Clears the trail's identity/content but keeps its PSRAM buffer
+  // allocated for reuse -- a plain `t = TrailHistory()` would instead null
+  // out lat/lon and leak the previous allocation.
+  void reset() { callsign[0] = 0; count = 0; lastSeenMs = 0; }
+  void ensureBuf() {
+    if (!lat) {
+      lat = (double *)ps_malloc(sizeof(double) * TRAIL_LEN);
+      lon = (double *)ps_malloc(sizeof(double) * TRAIL_LEN);
+      distKm = (float *)ps_malloc(sizeof(float) * TRAIL_LEN);
+      sinB = (float *)ps_malloc(sizeof(float) * TRAIL_LEN);
+      cosB = (float *)ps_malloc(sizeof(float) * TRAIL_LEN);
+    }
+  }
+};
+static TrailHistory trails[TRAIL_SLOTS];
+// Home location the polar cache was computed against; when it differs from
+// the current config, every cached sample is reprojected once (rare).
+static double cacheHomeLat = 1e9, cacheHomeLon = 1e9;
+
 enum TrailClass : uint8_t { TC_OVER = 0, TC_DEP, TC_ARR };
-static TrailClass classifyBlip(const Blip &b, float nearKm, uint16_t maxAltFt, int16_t vrateFpm) {
-  if (b.altitudeM * 3.28084f >= (float)maxAltFt) return TC_OVER;
+static TrailClass classifyBlip(const Blip &b, float nearKm, uint16_t maxAltFt, int16_t vrateFpm) {  if (b.altitudeM * 3.28084f >= (float)maxAltFt) return TC_OVER;
   for (uint8_t a = 0; a < AIRPORT_COUNT; a++) {
     if (haversineKm(b.lat, b.lon, AIRPORTS[a].lat, AIRPORTS[a].lon) <= (double)nearKm) {
       if (b.vrateFpm > vrateFpm) return TC_DEP;
@@ -215,6 +260,37 @@ static inline void trailPolar(float lat1, float lon1, float lat2, float lon2, fl
   float y = sinf(dLon) * cosf(lat2 * D2R);
   float x = cosf(lat1 * D2R) * sinf(lat2 * D2R) - sinf(lat1 * D2R) * cosf(lat2 * D2R) * cosf(dLon);
   brgDeg = fmodf(atan2f(y, x) / D2R + 360.0f, 360.0f);
+}
+
+// Projects one trail sample into the polar cache (distKm/sinB/cosB) —
+// called exactly once per sample (at append, or when home location changes),
+// never in the per-redraw draw loop.
+static void trailProject(TrailHistory &t, uint16_t idx, double hLat, double hLon) {
+  float dist, brg;
+  trailPolar((float)hLat, (float)hLon, (float)t.lat[idx], (float)t.lon[idx], dist, brg);
+  float br = brg * (float)PI / 180.0f;
+  t.distKm[idx] = dist;
+  t.sinB[idx] = sinf(br);
+  t.cosB[idx] = cosf(br);
+}
+
+// Appends one sample, keeping lat/lon and the polar cache in sync. Shift-on-
+// full uses memmove for all five arrays (the old per-element loop moved
+// 28.8KB by hand every append).
+static void trailAppend(TrailHistory &t, uint16_t cap, double hLat, double hLon, double blat, double blon) {
+  if (t.count < cap) {
+    t.lat[t.count] = blat; t.lon[t.count] = blon;
+    trailProject(t, t.count, hLat, hLon);
+    t.count++;
+  } else {
+    memmove(t.lat, t.lat + 1, (cap - 1) * sizeof(double));
+    memmove(t.lon, t.lon + 1, (cap - 1) * sizeof(double));
+    memmove(t.distKm, t.distKm + 1, (cap - 1) * sizeof(float));
+    memmove(t.sinB, t.sinB + 1, (cap - 1) * sizeof(float));
+    memmove(t.cosB, t.cosB + 1, (cap - 1) * sizeof(float));
+    t.lat[cap - 1] = blat; t.lon[cap - 1] = blon;
+    trailProject(t, cap - 1, hLat, hLon);
+  }
 }
 
 // Real double-buffered RGB panel, bypassing Arduino_GFX's RGB bus classes
@@ -386,18 +462,29 @@ static Arduino_Canvas *bgFrame = nullptr;     // last completed full frame (vali
 // any label/ring/trail the sweep crossed, which accumulated into visibly
 // "fuzzy" plane names between full redraws (sweep stayed clean — the damage
 // was to the text). Bresenham over raw RGB565 buffers.
-static void restoreLine(uint16_t *dst, const uint16_t *src, int x0, int y0, int x1, int y1) {
+//
+// plotLine() below draws the sweep with THE EXACT SAME rasterization —
+// drawing with Arduino_GFX's drawLine but erasing with this Bresenham left
+// un-erased specks along the old line (the two algorithms' tie-breaking
+// differs by a pixel here and there), which showed up as sweep artifacts.
+static inline void linePixels(uint16_t *dst, const uint16_t *src, int x0, int y0, int x1, int y1, uint16_t color) {
   int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
   int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
   int err = dx + dy;
   for (;;) {
     if (x0 >= 0 && x0 < LCD_W && y0 >= 0 && y0 < LCD_H)
-      dst[(size_t)y0 * LCD_W + x0] = src[(size_t)y0 * LCD_W + x0];
+      dst[(size_t)y0 * LCD_W + x0] = src ? src[(size_t)y0 * LCD_W + x0] : color;
     if (x0 == x1 && y0 == y1) break;
     int e2 = 2 * err;
     if (e2 >= dy) { err += dy; x0 += sx; }
     if (e2 <= dx) { err += dx; y0 += sy; }
   }
+}
+static void restoreLine(uint16_t *dst, const uint16_t *src, int x0, int y0, int x1, int y1) {
+  linePixels(dst, src, x0, y0, x1, y1, 0);
+}
+static void plotLine(uint16_t *dst, int x0, int y0, int x1, int y1, uint16_t color) {
+  linePixels(dst, nullptr, x0, y0, x1, y1, color);
 }
 
 // Presents the just-drawn frame: hands the driver the pointer of the buffer
@@ -429,36 +516,6 @@ GT911_Touch touch(TOUCH_INT, ioExpander);
 // GET /timingdebug -- so we can see exactly where a frame's time goes
 // (canvas clear vs. screen draw vs. driver push) instead of guessing.
 static volatile uint32_t lastFillUs = 0, lastDrawUs = 0, lastPushUs = 0, lastFrameIntervalMs = 0;
-
-// Flight-path trace history (Radar screen, showTraces toggle). Keyed by
-// callsign rather than blips[] array index, since that index isn't stable
-// between fetch cycles — a trail must follow one aircraft, not one array
-// slot. Lives here (not shared.h/data.cpp) since it's purely a rendering
-// concern local to this board's Radar screen.
-// 1800 samples ~= 15-30 min of history at this screen's 1-2Hz full-redraw
-// sampling rate -- long enough that no realistic single viewing session
-// should ever see a trail age out by hitting this cap; only true staleness
-// (the trailStaleSec config, aircraft actually gone) should ever clear a trail. Backed
-// by PSRAM (ps_malloc, lazily allocated per slot and kept for the life of
-// the program) rather than a fixed struct member -- 1800*16 bytes*20 slots
-// is ~560KB, too big to want living in internal SRAM/.bss alongside
-// everything else, but trivial against this board's 8MB PSRAM.
-#define TRAIL_LEN 1800
-#define TRAIL_SLOTS MAX_BLIPS
-struct TrailHistory {
-  char callsign[10] = {0};
-  double *lat = nullptr, *lon = nullptr;  // ps_malloc'd on first use, kept across resets
-  uint16_t count = 0;  // TRAIL_LEN > 255, so this can't be uint8_t
-  uint32_t lastSeenMs = 0;
-  // Clears the trail's identity/content but keeps its PSRAM buffer
-  // allocated for reuse -- a plain `t = TrailHistory()` would instead null
-  // out lat/lon and leak the previous allocation.
-  void reset() { callsign[0] = 0; count = 0; lastSeenMs = 0; }
-  void ensureBuf() {
-    if (!lat) { lat = (double *)ps_malloc(sizeof(double) * TRAIL_LEN); lon = (double *)ps_malloc(sizeof(double) * TRAIL_LEN); }
-  }
-};
-static TrailHistory trails[TRAIL_SLOTS];
 
 bool timeReady() { return time(nullptr) > 1700000000; }
 void fmtClock(char* buf, size_t n, bool withSecs) {
@@ -957,14 +1014,29 @@ void drawRadarStatic(const RadarLayout &L, const RadarCfg &cfg) {
     }
   }
 
+  // Record where the sweep IS now — but do NOT draw it. The sweep is drawn
+  // exclusively by the tick paths (fast zero-copy ticks, direct draws during
+  // staging), never into a staged frame: bgFrame is the clean background
+  // source for restoreLine() erases, and a sweep line baked into it would be
+  // resurrected as a ghost line on every erase. The endpoint is still needed
+  // to seed each buffer's erase position at SL_SWAP / screen entry.
   drawnSweepX = cx + (int)(sin(sw) * R);
   drawnSweepY = cy - (int)(cos(sw) * R);
-  gfx->drawLine(cx, cy, drawnSweepX, drawnSweepY, cfg.cSweep);
 
   // --- Trail sampling: append one position per aircraft per redraw cycle.
   // Keyed by callsign since blips[] array indices aren't stable between
   // fetch cycles. Cap is runtime-configurable (trailMaxSamples).
   if (showTraces) {
+    // Home moved since the polar cache was computed? Reproject everything
+    // once (rare — only on a config change).
+    if (cacheHomeLat != cfg.hLat || cacheHomeLon != cfg.hLon) {
+      for (uint8_t s = 0; s < TRAIL_SLOTS; s++) {
+        TrailHistory &t = trails[s];
+        if (!t.callsign[0] || !t.lat) continue;
+        for (uint16_t j = 0; j < t.count; j++) trailProject(t, j, cfg.hLat, cfg.hLon);
+      }
+      cacheHomeLat = cfg.hLat; cacheHomeLon = cfg.hLon;
+    }
     for (uint8_t i = 0; i < blipCount; i++) {
       if (!blips[i].callsign[0]) continue;
       int slot = -1, oldest = 0;
@@ -987,14 +1059,12 @@ void drawRadarStatic(const RadarLayout &L, const RadarCfg &cfg) {
         uint16_t drop = t.count - cap;
         memmove(t.lat, t.lat + drop, cap * sizeof(double));
         memmove(t.lon, t.lon + drop, cap * sizeof(double));
+        memmove(t.distKm, t.distKm + drop, cap * sizeof(float));
+        memmove(t.sinB, t.sinB + drop, cap * sizeof(float));
+        memmove(t.cosB, t.cosB + drop, cap * sizeof(float));
         t.count = cap;
       }
-      if (t.count < cap) {
-        t.lat[t.count] = blips[i].lat; t.lon[t.count] = blips[i].lon; t.count++;
-      } else {
-        for (uint16_t j = 1; j < cap; j++) { t.lat[j-1] = t.lat[j]; t.lon[j-1] = t.lon[j]; }
-        t.lat[cap-1] = blips[i].lat; t.lon[cap-1] = blips[i].lon;
-      }
+      trailAppend(t, cap, cfg.hLat, cfg.hLon, blips[i].lat, blips[i].lon);
       t.lastSeenMs = nowMs;
     }
   }
@@ -1021,14 +1091,12 @@ void drawRadarTrails(const RadarLayout &L, const RadarCfg &cfg, uint8_t slotFrom
       uint16_t trailColor = owner ? trailColors[classifyBlip(*owner, cfg.cNear, cfg.cAlt, cfg.cVr)] : cfg.cTrOver;
       int prevPx = 0, prevPy = 0; bool havePrev = false;
       for (uint16_t j = 0; j < t.count; j++) {
-        float dist, brg;
-        trailPolar((float)cfg.hLat, (float)cfg.hLon, (float)t.lat[j], (float)t.lon[j], dist, brg);
-        float fr = dist / cfg.rMax;
+        // Polar cache hit: no trig here at all, just scale + offset.
+        float fr = t.distKm[j] / cfg.rMax;
         if (fr > 1) { havePrev = false; continue; }
         int rr = (int)(fr * R);
-        float br = brg * (float)PI / 180.0f;
-        int px = cx + (int)(sinf(br) * rr);
-        int py = cy - (int)(cosf(br) * rr);
+        int px = cx + (int)(t.sinB[j] * rr);
+        int py = cy - (int)(t.cosB[j] * rr);
         if (havePrev) gfx->drawLine(prevPx, prevPy, px, py, trailColor);
         prevPx = px; prevPy = py; havePrev = true;
       }
@@ -1294,11 +1362,15 @@ void runStagingSlice(const RadarLayout &L) {
   Arduino_Canvas *stg = stagingCanvas[stgRenderIdx];
   switch (slice) {
     case SL_FILL_A:
-      stg->fillRect(0, 0, LCD_W, LCD_H / 2, BLACK);
+      // Raw memset, not canvas fillRect: ROM memset does 32-bit stores in a
+      // single flat call (~40ms for the full frame vs ~74ms through the
+      // canvas's per-row path — PSRAM write bandwidth is the wall either way).
+      memset(stg->getFramebuffer(), 0, (size_t)LCD_W * (LCD_H / 2) * sizeof(uint16_t));
       slice = SL_FILL_B;
       break;
     case SL_FILL_B:
-      stg->fillRect(0, LCD_H / 2, LCD_W, LCD_H - LCD_H / 2, BLACK);
+      memset((uint8_t *)stg->getFramebuffer() + (size_t)LCD_W * (LCD_H / 2) * sizeof(uint16_t), 0,
+             (size_t)LCD_W * (LCD_H - LCD_H / 2) * sizeof(uint16_t));
       slice = SL_STATIC;
       break;
     case SL_STATIC: {
@@ -1397,7 +1469,7 @@ void renderRadar(bool justEntered) {
     directGfx->setBuffer(panelFbs[drawBufIdx]);
 
     uint32_t t0 = micros();
-    gfx->fillScreen(BLACK);
+    memset(panelFbs[drawBufIdx], 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));  // raw fill — see SL_FILL_A
     uint32_t t1 = micros();
     if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
     drawRadarAll(L);
@@ -1441,9 +1513,8 @@ void renderRadar(bool justEntered) {
       int newX = L.cx + (int)(sin(sw) * L.R);
       int newY = L.cy - (int)(cos(sw) * L.R);
       uint8_t act = drawBufIdx ^ 1;
-      directGfx->setBuffer(panelFbs[act]);
       if (havePrevSweep[act]) restoreLine(panelFbs[act], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[act], prevSweepY[act]);
-      directGfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
+      plotLine(panelFbs[act], L.cx, L.cy, newX, newY, cSweepCol);
       prevSweepX[act] = newX; prevSweepY[act] = newY; havePrevSweep[act] = true;
       return;
     }
@@ -1459,9 +1530,8 @@ void renderRadar(bool justEntered) {
     double sw = deg2rad(sweepDeg);
     int newX = L.cx + (int)(sin(sw) * L.R);
     int newY = L.cy - (int)(cos(sw) * L.R);
-    directGfx->setBuffer(panelFbs[drawBufIdx]);
     if (havePrevSweep[drawBufIdx]) restoreLine(panelFbs[drawBufIdx], bgFrame->getFramebuffer(), L.cx, L.cy, prevSweepX[drawBufIdx], prevSweepY[drawBufIdx]);
-    gfx->drawLine(L.cx, L.cy, newX, newY, cSweepCol);
+    plotLine(panelFbs[drawBufIdx], L.cx, L.cy, newX, newY, cSweepCol);
     prevSweepX[drawBufIdx] = newX; prevSweepY[drawBufIdx] = newY; havePrevSweep[drawBufIdx] = true;
     pushFrame();
     return;
@@ -1504,7 +1574,7 @@ void render() {
   lastDraw = now;
 
   uint32_t t0 = micros();
-  gfx->fillScreen(BLACK);
+  memset(panelFbs[drawBufIdx], 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));  // raw fill — see SL_FILL_A
   uint32_t t1 = micros();
 
   if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
