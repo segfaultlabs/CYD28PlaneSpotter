@@ -855,6 +855,24 @@ static String rgb565ToHex(uint16_t c) {
 }
 
 void initWebServer() {
+  // GET /wifiscan — synchronous scan (~2-3s, runs on the Core-0 web task so
+  // rendering is unaffected), returns JSON for the config page's picker.
+  server.on("/wifiscan", []() {
+    int n = WiFi.scanNetworks();
+    String json = "[";
+    for (int i = 0; i < n; i++) {
+      String ssid = WiFi.SSID(i);
+      ssid.replace("\\", "\\\\");
+      ssid.replace("\"", "\\\"");
+      if (i) json += ",";
+      json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+              ",\"open\":" + String(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? 1 : 0) + "}";
+    }
+    json += "]";
+    WiFi.scanDelete();
+    server.send(200, "application/json", json);
+  });
+
   // GET / — serve config page
   server.on("/", []() {
     // Snapshot current values
@@ -921,18 +939,24 @@ void initWebServer() {
   <form id="cfg" onsubmit="save(event)">
     <div class="section-hd" style="border-top:none;padding-top:0;margin-top:0">WiFi Networks</div>
     <div class="note">Up to 4 saved networks, tried in order. If none are reachable the device starts its own "PlaneSpotter-Setup" AP &mdash; connect to it and open 192.168.4.1 to fix settings.</div>
+    <div style="margin:6px 0">
+      <button type="button" onclick="wifiScan()" style="width:auto;padding:8px 16px;margin-top:0">Scan for networks</button>
+      fill slot <select id="scanSlot" style="width:auto"><option value="0">1</option><option value="1">2</option><option value="2">3</option><option value="3">4</option></select>
+      <label style="display:inline;margin-left:12px"><input type="checkbox" style="width:auto" onchange="togglePw(this)"> show passwords</label>
+    </div>
+    <div id="scanResults"></div>
     <label>Network 1 SSID / Password</label>
     <input type="text" name="wssid0" id="wssid0" maxlength="32" value=")rawliteral" + String(wifiNets[0].ssid) + R"rawliteral(">
-    <input type="text" name="wpass0" id="wpass0" maxlength="64" value=")rawliteral" + String(wifiNets[0].pass) + R"rawliteral(">
+    <input type="password" name="wpass0" id="wpass0" maxlength="64" value=")rawliteral" + String(wifiNets[0].pass) + R"rawliteral(">
     <label>Network 2 SSID / Password</label>
     <input type="text" name="wssid1" id="wssid1" maxlength="32" value=")rawliteral" + String(wifiNets[1].ssid) + R"rawliteral(">
-    <input type="text" name="wpass1" id="wpass1" maxlength="64" value=")rawliteral" + String(wifiNets[1].pass) + R"rawliteral(">
+    <input type="password" name="wpass1" id="wpass1" maxlength="64" value=")rawliteral" + String(wifiNets[1].pass) + R"rawliteral(">
     <label>Network 3 SSID / Password</label>
     <input type="text" name="wssid2" id="wssid2" maxlength="32" value=")rawliteral" + String(wifiNets[2].ssid) + R"rawliteral(">
-    <input type="text" name="wpass2" id="wpass2" maxlength="64" value=")rawliteral" + String(wifiNets[2].pass) + R"rawliteral(">
+    <input type="password" name="wpass2" id="wpass2" maxlength="64" value=")rawliteral" + String(wifiNets[2].pass) + R"rawliteral(">
     <label>Network 4 SSID / Password</label>
     <input type="text" name="wssid3" id="wssid3" maxlength="32" value=")rawliteral" + String(wifiNets[3].ssid) + R"rawliteral(">
-    <input type="text" name="wpass3" id="wpass3" maxlength="64" value=")rawliteral" + String(wifiNets[3].pass) + R"rawliteral(">
+    <input type="password" name="wpass3" id="wpass3" maxlength="64" value=")rawliteral" + String(wifiNets[3].pass) + R"rawliteral(">
     <div class="section-hd">Location &amp; Radar</div>
     <label>Home Latitude (&deg;)</label>
     <input type="number" step="any" name="lat" id="lat" value=")rawliteral" + String(hLat, 6) + R"rawliteral(" required>
@@ -1200,6 +1224,38 @@ function useMyLocation() {
   });
 }
 }  // end if (window.L)
+// --- WiFi scan + password show/hide
+function togglePw(cb){
+  for (var i = 0; i < 4; i++) document.getElementById('wpass' + i).type = cb.checked ? 'text' : 'password';
+}
+function wifiScan(){
+  var out = document.getElementById('scanResults');
+  out.textContent = 'Scanning...';
+  var x = new XMLHttpRequest();
+  x.open('GET', '/wifiscan', true);
+  x.onload = function(){
+    if (x.status != 200) { out.textContent = 'Scan failed'; return; }
+    var nets = JSON.parse(x.responseText);
+    out.textContent = '';
+    if (!nets.length) { out.textContent = 'No networks found'; return; }
+    nets.forEach(function(n){
+      var d = document.createElement('div');
+      d.style.margin = '4px 0';
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = 'Use';
+      b.style.cssText = 'width:auto;padding:2px 10px;margin:0 6px 0 0;font-size:0.85em';
+      b.onclick = function(){ document.getElementById('wssid' + document.getElementById('scanSlot').value).value = n.ssid; };
+      var t = document.createElement('span');
+      t.textContent = n.ssid + '  (' + n.rssi + ' dBm' + (n.open ? ', open' : '') + ')';
+      t.style.fontSize = '0.9em';
+      d.appendChild(b); d.appendChild(t);
+      out.appendChild(d);
+    });
+  };
+  x.onerror = function(){ out.textContent = 'Scan failed'; };
+  x.send();
+}
 // --- filter rules init
 function initRule(i,en,m,t,a,c){
   document.getElementById('fr_en'+i).checked=(en==1);
