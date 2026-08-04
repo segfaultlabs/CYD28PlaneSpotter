@@ -120,6 +120,31 @@ gitignored. Safe to delete or gitignore; harmless if left.
   version-pinned `platform = espressif32@6.6.0` on the three stable envs,
   added the `[env:lcd7b_v2]` block.
 
+## Regression checklist (run after any feature batch, before tagging known-good)
+
+Live checks against the device (replace IP):
+1. `/health` — no reset_reason change you didn't cause; heap_min_free and
+   heap_largest_block stable vs. pre-change baseline; api_ok incrementing,
+   api_fail flat; fetch_stage=5; last_cycle_age_ms ~500 on radar screens.
+2. **Persistence**: set 3+ distinctive values across different settings
+   groups via /save, then POST /reboot, verify they read back correctly.
+   (Covers configMaintain flush + the /reboot pre-flush.)
+3. **Save-under-load**: 10 rapid /save calls (range 30↔120) — all 200, no
+   reset, screen keeps rendering (user visually confirms no glitch/desync).
+4. **Screen cycle**: confirm screens advance on the auto-cycle interval
+   (`screen` field in /health changes), and that touching the panel pauses
+   cycling for one interval.
+5. **Zoom buttons**: 10 rapid +/- presses on each radar screen — range
+   changes visibly within ~1s, no display glitch.
+6. **Sweep quality** (user eyes): no jitter, no splits, no ghost lines,
+   labels stay sharp for 30+ min, afterglow fades evenly.
+7. **All four envs build**: `pio run -e cyd -e jc4832 -e lcd7b` plus
+   `PLATFORMIO_CORE_DIR=~/.platformio_lcd7b_v2 pio run -e lcd7b_v2` — in
+   that order LAST for v2 (pio auto-cleans .pio/build between core dirs;
+   always flash v2 immediately after building it).
+8. **Soak**: leave running 1h+; cron `/health` watch for heap stair-step
+   or unexpected resets.
+
 ## `lcd7b_v2` — current technical state
 
 Full history in `LCD7B_V2_DEBUG_LOG.md`. Short version:

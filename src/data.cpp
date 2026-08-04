@@ -1690,6 +1690,10 @@ function doReboot(){
 
   // POST /reboot — remote restart (confirm dialog on the page is the only guard)
   server.on("/reboot", HTTP_POST, []() {
+    // Flush deferred config writes before restarting, or a save made within
+    // the last ~2s (configMaintain's idle window) would be silently lost.
+    if (configDirty) { configDirty = false; configPersistAll(); }
+    if (rangeDirty) { rangeDirty = false; prefs.putFloat("range", radarMaxKm); }
     server.send(200, "text/plain", "Rebooting...");
     delay(500);
     ESP.restart();
