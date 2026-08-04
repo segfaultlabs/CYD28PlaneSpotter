@@ -764,6 +764,8 @@ void initWebServer() {
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CYD Plane Spotter</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   body{font-family:Arial,sans-serif;background:#0a0a1a;color:#e0e0e0;margin:0;padding:20px}
   h1{color:#00ff88;text-align:center;font-size:1.4em}
@@ -812,6 +814,10 @@ void initWebServer() {
     <input type="number" step="any" name="lat" id="lat" value=")rawliteral" + String(hLat, 6) + R"rawliteral(" required>
     <label>Home Longitude (&deg;)</label>
     <input type="number" step="any" name="lon" id="lon" value=")rawliteral" + String(hLon, 6) + R"rawliteral(" required>
+    <div id="map" style="height:300px;border-radius:8px;margin:8px 0;background:#0d0d1f"></div>
+    <div class="note">Click the map to set home (needs internet in THIS browser for the map tiles). The green circle previews your radar range. Number fields stay in sync both ways.</div>
+    <button type="button" onclick="useMyLocation()" style="margin-top:0;background:#2a2a4a;color:#e0e0e0">Use my current location</button>
+    <div class="note" style="margin-bottom:8px">(browser may block location on plain http &mdash; the map click always works)</div>
     <label>Radar Max Range (km) &mdash; also sets data fetch radius</label>
     <input type="number" step="any" name="range" id="range" value=")rawliteral" + String(rMax, 1) + R"rawliteral(" required>
     <div class="switch-row">
@@ -967,6 +973,37 @@ void initWebServer() {
 </div>
 <div class="info">IP: )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
+// --- Location map (Leaflet + OSM; tiles load in the browser, not the device)
+var map = L.map('map').setView([)rawliteral" + String(hLat, 6) + R"rawliteral(, )rawliteral" + String(hLon, 6) + R"rawliteral(], 9);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(map);
+var marker = L.marker([)rawliteral" + String(hLat, 6) + R"rawliteral(, )rawliteral" + String(hLon, 6) + R"rawliteral(], {draggable: true}).addTo(map);
+var rangeCircle = L.circle([)rawliteral" + String(hLat, 6) + R"rawliteral(, )rawliteral" + String(hLon, 6) + R"rawliteral(], {radius: )rawliteral" + String(rMax * 1000.0f, 0) + R"rawliteral(, color: '#00ff88', weight: 1, fillOpacity: 0.05}).addTo(map);
+function setLatLon(lat, lon) {
+  document.getElementById('lat').value = lat.toFixed(6);
+  document.getElementById('lon').value = lon.toFixed(6);
+  marker.setLatLng([lat, lon]);
+  rangeCircle.setLatLng([lat, lon]);
+}
+map.on('click', function(e) { setLatLon(e.latlng.lat, e.latlng.lng); });
+marker.on('dragend', function() { var p = marker.getLatLng(); setLatLon(p.lat, p.lng); });
+function syncFromInputs() {
+  var la = parseFloat(document.getElementById('lat').value);
+  var lo = parseFloat(document.getElementById('lon').value);
+  if (!isNaN(la) && !isNaN(lo)) { marker.setLatLng([la, lo]); rangeCircle.setLatLng([la, lo]); map.panTo([la, lo]); }
+}
+document.getElementById('lat').addEventListener('change', syncFromInputs);
+document.getElementById('lon').addEventListener('change', syncFromInputs);
+document.getElementById('range').addEventListener('change', function() {
+  var r = parseFloat(document.getElementById('range').value);
+  if (!isNaN(r)) rangeCircle.setRadius(r * 1000);
+});
+function useMyLocation() {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(function(pos) {
+    setLatLon(pos.coords.latitude, pos.coords.longitude);
+    map.setView([pos.coords.latitude, pos.coords.longitude], 11);
+  });
+}
 function save(e){
   e.preventDefault();
   var x=new XMLHttpRequest();
