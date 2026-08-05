@@ -381,7 +381,11 @@ IRAM_ATTR static bool onVsync(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_pa
   return false;
 }
 static void waitFrameDone() {
-  while (xSemaphoreTake(frameDoneSem, 0) == pdTRUE) {}  // drain stale signal
+  // Bounded drain: an event storm (e.g. a wedged driver after a mid-stream
+  // restart) would otherwise spin here forever and trip the task watchdog —
+  // exactly what prev_boot_phase=50 showed happening.
+  int guard = 0;
+  while (xSemaphoreTake(frameDoneSem, 0) == pdTRUE && ++guard < 64) {}
   xSemaphoreTake(frameDoneSem, pdMS_TO_TICKS(200));
 }
 
@@ -1665,12 +1669,12 @@ void applyBrightness(uint8_t percent) {
   ioExpander.setBacklight(percent);
 }
 
-// Hard resync after NVS/flash-write bursts: force the RGB driver's DMA to
-// restart, recovering deterministically from any cache-off-induced underrun
-// instead of hoping the vsync self-recovery notices (it often doesn't).
-void displayPanelSync() {
-  if (panelHandle) esp_lcd_rgb_panel_restart(panelHandle);
-}
+// Hard resync after NVS/flash-write bursts. The esp_lcd_rgb_panel_restart()
+// call this used to make is REVERTED: restarting the DMA mid-stream
+// destabilized the driver's event pattern and is the prime suspect in a
+// pushFrame-wait watchdog boot-loop (prev_boot_phase=50). The vsync self-
+// recovery in the driver covers underruns well enough in practice.
+void displayPanelSync() {}
 
 // --- Staged (scheduled) radar redraw -------------------------------------
 // A monolithic full redraw costs ~200-300ms (fill + trails/blips + present

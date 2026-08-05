@@ -4,6 +4,50 @@ Written for whoever/whatever picks this up next. Facts and current state
 only, organized so you don't have to re-derive anything from git history or
 chat logs.
 
+## ⛔ READ FIRST — device is mid-recovery (as of 2026-08-05)
+
+**The LCD-7B panel is boot-looping and needs a USB flash to recover.** Full
+story:
+
+- A bad OTA (120MHz-config app on the stock 80MHz bootloader — the
+  `lcd7b_v2`/`lcd7b_v3` mixup) started the instability; several later OTA
+  uploads then **died mid-write** because flash sector erases stall the CPU
+  cache longer than the task-watchdog timeout (reset_reason 6). Those dead
+  uploads left **garbage in the OTA slot at 0x650000**, and the bootloader
+  keeps selecting it → "invalid magic byte" → reset loop (confirmed from the
+  serial log).
+- The new build (`features` branch, `abbeff1` + later) fixes the OTA path
+  (TWDT tolerant during upload, fetch task suspended during flash) — but it
+  can't get on the device OTA, because OTA is what's broken.
+
+**Recovery = USB flash into BOTH OTA slots.** The UART port (not the one
+labeled USB) enumerates as `/dev/cu.usbmodem5B910516231` (a CH343 bridge).
+DTR/RTS auto-reset is NOT wired on this board — download mode is manual only:
+
+1. Unplug cable. Hold **BOOT**. Plug in. Count 3. Release. Screen black
+   forever = download mode. (If the radar appears, BOOT didn't engage.)
+2. Then run:
+   ```
+   cd /Users/luketrav/Projects/flight_radar
+   ~/.platformio_lcd7b_v2/penv/bin/python ~/.platformio_lcd7b_v2/packages/tool-esptoolpy/esptool.py \
+     --chip esp32s3 --port /dev/cu.usbmodem5B910516231 --before no_reset --after no_reset --baud 115200 \
+     write_flash 0x0 .pio/build/lcd7b_v2/firmware.factory.bin 0x650000 .pio/build/lcd7b_v2/firmware.bin
+   ```
+   Writing both slots matters: otadata may point at either, and both have
+   held garbage at some point. If the .pio build dir is gone (cleaned),
+   rebuild first: `PLATFORMIO_CORE_DIR=~/.platformio_lcd7b_v2 pio run -e lcd7b_v2`.
+3. One attempt DID connect and write 13% before the chip's crash-reset
+   killed it — the path works; it's a persistence/timing game. Best results
+   came from flashing immediately after a fresh BOOT-held power-up.
+   Marginal USB power is a suspected factor (panel + backlight + flash
+   writes) — a high-current port / powered hub helps.
+
+After a successful flash: the device should boot the `features`-branch
+build, answer `http://192.168.1.75/health`, and OTA should work again
+(verify with one no-op OTA re-upload). If it still boot-loops, check
+`/health`'s `prev_boot_phase` field (crash forensics — the loop-phase
+marker from the previous boot, in RTC RAM).
+
 ## What this project is
 
 ESP32-based real-time ADS-B aircraft radar display. One codebase, three
@@ -58,27 +102,47 @@ Device used during this work: `192.168.1.75` (adjust for your network).
 
 ## Current git state
 
-Branch `master`, uncommitted working tree (nothing in this session has been
-committed). `git status --short`:
-```
- M src/IOExtension.cpp
- M src/data.cpp
- M src/display_cyd.cpp
- M src/display_jc4832.cpp
- M src/display_lcd7b.cpp
- M src/display_lcd7b_v2.cpp
- M src/main.cpp
- M src/shared.h
-?? LCD7B_V2_DEBUG_LOG.md
-?? HANDOFF.md
-?? src/idf_component.yml
-```
-`src/idf_component.yml` is a stray auto-generated artifact from an
-ESP-IDF component-manager step during an `lcd7b_v2` build (content is just
-`dependencies: idf: '>=5.1'`). Not intentionally created, not currently
-gitignored. Safe to delete or gitignore; harmless if left.
+Branch `features` (pushed) is ~25 commits ahead of `master` and is what the
+device last ran. Master is tagged `known-good-2026-08-03` (the stable
+pre-feature state). Unmerged work on `features`:
 
-### What changed in each modified file, this session
+- **Display engine**: zero-copy double buffering at 20MHz pclk; staged
+  (sliced) full redraws into ping-pong PSRAM staging buffers with an atomic
+  swap; vsync-aligned direct writes during the copy phase; phosphor
+  afterglow (configurable); background-restore sweep erase (no fuzzy
+  labels); plotLine/restoreLine identical-rasterizer pair.
+- **Features**: WiFi multi-network + fallback setup AP; map location picker
+  (Leaflet/OSM via CDN, guarded so a blocked CDN can't break Save);
+  traffic filter/watchlist (5 rules: callsign/reg/type prefix ×
+  highlight/hide/only/alert + quiet mode + banner); QR code + URL on stats
+  screen; animated weather widget + day/night auto-dim; auto-cycle (kiosk
+  mode, default 5s); vector map underlay (Natural Earth coastlines +
+  borders, polar-cached); WiFi scan picker; password masking; /reboot
+  button; /health diagnostics (heap, fetch stage, touch log, staging
+  state, prev_boot_phase crash forensics).
+- **Fixes**: deferred NVS persistence everywhere (flash writes were
+  glitching the panel / watchdogging mid-save); staging slice starvation
+  (content refreshed every ~20s — was the "planes frozen/zoom dead"
+  report); trail polar cache; PSRAM JSON docs + payload via writeToStream;
+  httpsMutex (one outbound TLS at a time); nightly-reboot option.
+- **Rejected/reverted with evidence**: 30-line bounce buffer (heap
+  starvation), esp_async_memcpy (bus-bound), SIMD on PSRAM (no gain),
+  esp_lcd_rgb_panel_restart after config writes (suspect in the boot
+  loop — reverted), 22MHz+ pclk on 80MHz PSRAM (drift).
+- **Pending**: `lcd7b_v3` (120MHz PSRAM + 64B cache line + IRAM-safe ISR +
+  30MHz pclk) is built and unflashed — the USB flash recovery above is the
+  same procedure it needs. Merge `features` → master after the device is
+  verified stable post-recovery.
+
+DISPLAY_SMOOTHNESS.md consolidates the display-engine learnings.
+LCD7B_V2_DEBUG_LOG.md has the chronological attempt history (#1-19).
+The regression checklist is below.
+
+## What changed in each file (older session notes)
+
+Historical note — the section below was written mid-way through the v2
+bring-up; the features branch has since changed far more than it lists. It
+is kept for context but the git log on `features` is the accurate record.
 
 - **`src/shared.h`** — added `extern uint8_t brightness;` and
   `void applyBrightness(uint8_t percent);` to the board interface.

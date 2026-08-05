@@ -209,4 +209,8 @@ void loop() {
 
   crashMarker = 7;
   render();
+
+  // Yield so the core's idle task always gets its watchdog feed — heavy
+  // staged-redraw cycles otherwise starve it and trip the task watchdog.
+  delay(1);
 }
